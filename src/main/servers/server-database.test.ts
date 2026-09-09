@@ -1,4 +1,5 @@
 import { createHash, generateKeyPairSync } from 'node:crypto'
+import { mkdtempSync, readFileSync } from 'node:fs'
 import { mkdtemp, readFile, rm, stat } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -12,17 +13,25 @@ import {
 } from '../security/authenticated-candidate'
 import {
   admitMemberWithInvite,
+  createChannel,
   DATABASE_FILE_NAME,
   DATABASE_SCHEMA_VERSION,
+  deleteChannel,
+  getChannelByName,
   getMemberByFingerprint,
   getStoredInvite,
   initializeServerDatabase,
+  listChannels,
   listMembers,
+  MAX_CHANNEL_NAME_CODE_POINTS,
+  MAX_CHANNELS_PER_SERVER,
   MAX_INITIAL_SERVER_DATABASE_BYTES,
   openServerDatabase,
   registerIssuedInvite,
+  renameChannel,
   revokeServerInvite,
   ServerDatabaseError,
+  setChannelArchived,
   validateServerDatabaseFile,
   verifyPersistedMemberAuthorization
 } from './server-database'
@@ -35,7 +44,7 @@ afterEach(async () => {
 })
 
 describe('fundação segura de SQLite, membership, invites, certificates e admissão', () => {
-  it('inicializa novo banco SQLite com schema version 4, members, member_certificates e invites tables', async () => {
+  it('inicializa novo banco SQLite com schema version 5, channels, invites, member_certificates e members', async () => {
     const root = await createTempDir()
     const dbPath = join(root, DATABASE_FILE_NAME)
     const owner = createTestDeviceIdentity()
@@ -66,6 +75,7 @@ describe('fundação segura de SQLite, membership, invites, certificates e admis
     expect(foreignKeys.foreign_keys).toBe(1)
     expect(trustedSchema.trusted_schema).toBe(0)
     expect(schemaObjects).toEqual([
+      { type: 'table', name: 'channels', tbl_name: 'channels' },
       { type: 'table', name: 'invites', tbl_name: 'invites' },
       { type: 'table', name: 'member_certificates', tbl_name: 'member_certificates' },
       { type: 'table', name: 'members', tbl_name: 'members' }
@@ -351,7 +361,7 @@ describe('fundação segura de SQLite, membership, invites, certificates e admis
       const owner = createTestDeviceIdentity()
       initializeServerDatabase(dbPath, owner)
       const raw = new DatabaseSync(dbPath)
-      raw.exec('DROP TABLE member_certificates; PRAGMA user_version = 3;')
+      raw.exec('DROP TABLE channels; DROP TABLE member_certificates; PRAGMA user_version = 3;')
       raw.prepare(`INSERT INTO invites VALUES (?, ?, 2000000000, 3, 1, 0);`).run(
         'a'.repeat(32), Buffer.alloc(32, 1)
       )
@@ -513,7 +523,7 @@ describe('fundação segura de SQLite, membership, invites, certificates e admis
       })
 
       const version = dbMigrated.prepare('PRAGMA user_version;').get() as { user_version: number }
-      expect(version.user_version).toBe(4)
+      expect(version.user_version).toBe(DATABASE_SCHEMA_VERSION)
 
       const certCount = dbMigrated.prepare('SELECT COUNT(*) as count FROM member_certificates;').get() as { count: number }
       expect(certCount.count).toBe(0)
@@ -687,6 +697,172 @@ describe('fundação segura de SQLite, membership, invites, certificates e admis
     }
   }, 30000)
 })
+
+describe('canais do servidor (ETAPA 8.2)', () => {
+  function createChannelFixture() {
+    const root = createTempDirSync()
+    const dbPath = join(root, DATABASE_FILE_NAME)
+    const owner = createTestDeviceIdentity()
+    initializeServerDatabase(dbPath, owner)
+    const db = openServerDatabase(dbPath, {
+      deviceFingerprint: owner.fingerprint,
+      publicKey: owner.publicKey
+    })
+    testRoots.push(root)
+    return { db, dbPath, owner }
+  }
+
+  it('cria, lista, renomeia, arquiva e remove canal como owner', () => {
+    const { db, owner } = createChannelFixture()
+    try {
+      const created = createChannel(db, {
+        name: 'Geral', actorFingerprint: owner.fingerprint, isOwner: true, nowSeconds: 100
+      })
+      expect(created.name).toBe('Geral')
+      expect(created.archived).toBe(false)
+      expect(created.createdAt).toBe(100)
+      expect(created.channelId).toMatch(/^[0-9a-f]{32}$/)
+
+      expect(listChannels(db)).toEqual([created])
+      expect(getChannelByName(db, 'Geral')).toEqual(created)
+
+      const renamed = renameChannel(db, {
+        channelId: created.channelId, name: 'Retaguarda', actorFingerprint: created.createdBy, isOwner: true
+      })
+      expect(renamed.name).toBe('Retaguarda')
+
+      const archived = setChannelArchived(db, {
+        channelId: created.channelId, archived: true, actorFingerprint: created.createdBy, isOwner: true
+      })
+      expect(archived.archived).toBe(true)
+
+      deleteChannel(db, { channelId: created.channelId, actorFingerprint: created.createdBy, isOwner: true })
+      expect(listChannels(db)).toEqual([])
+    } finally {
+      db.close()
+    }
+  })
+
+  it('rejeita não-owner, nomes inválidos, duplicados, IDs malformados e canal inexistente', () => {
+    const { db, owner } = createChannelFixture()
+    try {
+      expect(() => createChannel(db, {
+        name: 'X', actorFingerprint: owner.fingerprint, isOwner: false
+      })).toThrow(new ServerDatabaseError('SERVER_CHANNEL_UNAUTHORIZED'))
+      expect(() => createChannel(db, {
+        name: '', actorFingerprint: owner.fingerprint, isOwner: true
+      })).toThrow(new ServerDatabaseError('SERVER_CHANNEL_INVALID'))
+      expect(() => createChannel(db, {
+        name: 'a'.repeat(MAX_CHANNEL_NAME_CODE_POINTS + 1), actorFingerprint: owner.fingerprint, isOwner: true
+      })).toThrow(new ServerDatabaseError('SERVER_CHANNEL_INVALID'))
+      expect(() => createChannel(db, {
+        name: 'linha\nquebrada', actorFingerprint: owner.fingerprint, isOwner: true
+      })).toThrow(new ServerDatabaseError('SERVER_CHANNEL_INVALID'))
+
+      const created = createChannel(db, { name: 'Geral', actorFingerprint: owner.fingerprint, isOwner: true })
+      expect(() => createChannel(db, { name: 'Geral', actorFingerprint: owner.fingerprint, isOwner: true }))
+        .toThrow()
+      expect(() => createChannel(db, { name: 'Outro', actorFingerprint: owner.fingerprint, isOwner: true, channelId: created.channelId }))
+        .toThrow()
+
+      expect(() => renameChannel(db, {
+        channelId: created.channelId, name: 'Novo', actorFingerprint: owner.fingerprint, isOwner: false
+      })).toThrow(new ServerDatabaseError('SERVER_CHANNEL_UNAUTHORIZED'))
+      expect(() => renameChannel(db, {
+        channelId: 'z'.repeat(32), name: 'Novo', actorFingerprint: owner.fingerprint, isOwner: true
+      })).toThrow(new ServerDatabaseError('SERVER_CHANNEL_UNAUTHORIZED'))
+      expect(() => renameChannel(db, {
+        channelId: 'zz', name: 'Novo', actorFingerprint: owner.fingerprint, isOwner: true
+      })).toThrow(new ServerDatabaseError('SERVER_CHANNEL_UNAUTHORIZED'))
+      expect(() => deleteChannel(db, {
+        channelId: 'f'.repeat(32), actorFingerprint: owner.fingerprint, isOwner: true
+      })).toThrow(new ServerDatabaseError('SERVER_CHANNEL_NOT_FOUND'))
+
+      const failClosed = (operation: () => unknown): void => {
+        try {
+          operation()
+        } catch (error) {
+          expect(error).toBeInstanceOf(ServerDatabaseError)
+          return
+        }
+        expect.unreachable()
+      }
+      // Duplicate name rename fails closed and the transaction preserves state.
+      createChannel(db, { name: 'Outro', actorFingerprint: owner.fingerprint, isOwner: true })
+      failClosed(() => renameChannel(db, {
+        channelId: created.channelId, name: 'Outro', actorFingerprint: owner.fingerprint, isOwner: true
+      }))
+      expect(listChannels(db).some((channel) => channel.name === 'Geral')).toBe(true)
+    } finally {
+      db.close()
+    }
+  })
+
+  it('impõe limite de 128 canais e preserva estado em falha transacional', () => {
+    const { db, owner } = createChannelFixture()
+    try {
+      for (let index = 0; index < MAX_CHANNELS_PER_SERVER; index++) {
+        createChannel(db, {
+          name: `Canal ${index}`, actorFingerprint: owner.fingerprint, isOwner: true
+        })
+      }
+      expect(listChannels(db)).toHaveLength(MAX_CHANNELS_PER_SERVER)
+      expect(() => createChannel(db, {
+        name: 'Canal 129', actorFingerprint: owner.fingerprint, isOwner: true
+      })).toThrow(new ServerDatabaseError('SERVER_CHANNEL_LIMIT_REACHED'))
+      expect(listChannels(db)).toHaveLength(MAX_CHANNELS_PER_SERVER)
+
+      expect(() => createChannel(db, {
+        name: 'Canal 129', actorFingerprint: owner.fingerprint, isOwner: false
+      })).toThrow(new ServerDatabaseError('SERVER_CHANNEL_UNAUTHORIZED'))
+      expect(listChannels(db)).toHaveLength(MAX_CHANNELS_PER_SERVER)
+    } finally {
+      db.close()
+    }
+  })
+
+  it('migração v4 -> v5 adiciona channels e preserva dados', () => {
+    const root = createTempDirSync()
+    testRoots.push(root)
+    const dbPath = join(root, DATABASE_FILE_NAME)
+    const owner = createTestDeviceIdentity()
+    initializeServerDatabase(dbPath, owner)
+
+    const raw = new DatabaseSync(dbPath)
+    raw.exec('DROP TABLE channels; PRAGMA user_version = 4;')
+    raw.close()
+    const before = readFileSync(dbPath)
+
+    const migrated = openServerDatabase(dbPath, {
+      deviceFingerprint: owner.fingerprint,
+      publicKey: owner.publicKey
+    })
+    try {
+      expect(migrated.prepare('PRAGMA user_version;').get()).toMatchObject({ user_version: 5 })
+      expect(migrated.prepare('SELECT COUNT(*) AS count FROM channels;').get()).toMatchObject({ count: 0 })
+      expect(migrated.prepare('SELECT COUNT(*) AS count FROM members;').get()).toMatchObject({ count: 1 })
+    } finally {
+      migrated.close()
+    }
+    expect(readFileSync(dbPath)).not.toEqual(before)
+  })
+
+  it('canal criado referencia membro; remoção de membro referenciado falha fechada', () => {
+    const { db, owner } = createChannelFixture()
+    try {
+      createChannel(db, { name: 'Geral', actorFingerprint: owner.fingerprint, isOwner: true })
+      expect(() => db.exec(`DELETE FROM members WHERE device_fingerprint = '${owner.fingerprint}';`))
+        .toThrow()
+      expect(listChannels(db)).toHaveLength(1)
+    } finally {
+      db.close()
+    }
+  })
+})
+
+function createTempDirSync(): string {
+  return mkdtempSync(join(tmpdir(), 'masquerada-db-test-'))
+}
 
 function createTestDeviceIdentity() {
   const keyPair = generateKeyPairSync('ed25519')

@@ -11,6 +11,7 @@ import {
   unlink
 } from 'node:fs/promises'
 import { basename, dirname, isAbsolute, relative, resolve } from 'node:path'
+import type { DatabaseSync } from 'node:sqlite'
 
 import {
   InitialOwnerBindingError,
@@ -20,6 +21,12 @@ import {
   type InitialOwnerDeviceIdentity
 } from './initial-owner-binding'
 import {
+  createChannel,
+  deleteChannel,
+  listChannels,
+  renameChannel,
+  setChannelArchived,
+  type ServerChannel,
   DATABASE_FILE_NAME,
   admitMemberWithInvite,
   consumeServerInvite,
@@ -107,6 +114,11 @@ export type LocalServerStorageErrorCode =
   | 'SERVER_MEMBER_ALREADY_EXISTS'
   | 'SERVER_ADMISSION_INVALID_CANDIDATE'
   | 'SERVER_ADMISSION_FAILED'
+  | 'SERVER_CHANNEL_INVALID'
+  | 'SERVER_CHANNEL_NOT_FOUND'
+  | 'SERVER_CHANNEL_ALREADY_EXISTS'
+  | 'SERVER_CHANNEL_LIMIT_REACHED'
+  | 'SERVER_CHANNEL_UNAUTHORIZED'
   | 'SERVER_CREATION_FAILED'
   | 'SERVER_ID_COLLISION_LIMIT'
 
@@ -147,6 +159,11 @@ const ERROR_MESSAGES: Record<LocalServerStorageErrorCode, string> = {
   SERVER_MEMBER_ALREADY_EXISTS: 'A identidade do dispositivo candidato já é membro do servidor.',
   SERVER_ADMISSION_INVALID_CANDIDATE: 'A identidade do dispositivo candidato é inválida.',
   SERVER_ADMISSION_FAILED: 'Não foi possível admitir o novo membro no servidor com segurança.',
+  SERVER_CHANNEL_INVALID: 'O canal solicitado é inválido.',
+  SERVER_CHANNEL_NOT_FOUND: 'O canal do servidor não foi encontrado.',
+  SERVER_CHANNEL_ALREADY_EXISTS: 'Já existe um canal com esse nome no servidor.',
+  SERVER_CHANNEL_LIMIT_REACHED: 'O servidor atingiu o número máximo de canais.',
+  SERVER_CHANNEL_UNAUTHORIZED: 'Apenas o owner pode gerenciar canais do servidor.',
   SERVER_CREATION_FAILED: 'Não foi possível criar o servidor local com segurança.',
   SERVER_ID_COLLISION_LIMIT: 'Não foi possível reservar um identificador local único.'
 }
@@ -621,8 +638,160 @@ export function createLocalServerStorage(
       } finally {
         db.close()
       }
+    },
+
+    createLocalServerChannel: async (
+      localStorageId: string,
+      options: { readonly name: string; readonly actorFingerprint: string; readonly nowSeconds?: number }
+    ): Promise<ServerChannel> => {
+      const channel = await mutateChannelTable(localStorageId, options.actorFingerprint, (db, authorization) =>
+        createChannel(db, {
+          name: options.name,
+          actorFingerprint: options.actorFingerprint,
+          isOwner: authorization.isOwner,
+          nowSeconds: options.nowSeconds
+        })
+      )
+      return channel!
+    },
+
+    renameLocalServerChannel: async (
+      localStorageId: string,
+      options: { readonly channelId: string; readonly name: string; readonly actorFingerprint: string }
+    ): Promise<ServerChannel> => {
+      const channel = await mutateChannelTable(localStorageId, options.actorFingerprint, (db, authorization) =>
+        renameChannel(db, {
+          channelId: options.channelId,
+          name: options.name,
+          actorFingerprint: options.actorFingerprint,
+          isOwner: authorization.isOwner
+        })
+      )
+      return channel!
+    },
+
+    setLocalServerChannelArchived: async (
+      localStorageId: string,
+      options: { readonly channelId: string; readonly archived: boolean; readonly actorFingerprint: string }
+    ): Promise<ServerChannel> => {
+      const channel = await mutateChannelTable(localStorageId, options.actorFingerprint, (db, authorization) =>
+        setChannelArchived(db, {
+          channelId: options.channelId,
+          archived: options.archived,
+          actorFingerprint: options.actorFingerprint,
+          isOwner: authorization.isOwner
+        })
+      )
+      return channel!
+    },
+
+    deleteLocalServerChannel: async (
+      localStorageId: string,
+      options: { readonly channelId: string; readonly actorFingerprint: string }
+    ): Promise<void> => {
+      await mutateChannelTable(localStorageId, options.actorFingerprint, (db, authorization) => {
+        deleteChannel(db, {
+          channelId: options.channelId,
+          actorFingerprint: options.actorFingerprint,
+          isOwner: authorization.isOwner
+        })
+      })
+    },
+
+    listLocalServerChannels: async (
+      localStorageId: string
+    ): Promise<readonly ServerChannel[]> => {
+      assertValidStorageId(localStorageId)
+      const rootRealPath = await inspectServersRoot(serversRoot)
+
+      if (!rootRealPath) {
+        throw new LocalServerStorageError('SERVER_NOT_FOUND')
+      }
+
+      const server = await loadLocalServerFromRoot(
+        serversRoot,
+        rootRealPath,
+        localStorageId,
+        secureStorage,
+        platform
+      )
+      const serverDirectory = deriveDirectChildPath(serversRoot, localStorageId)
+      const databasePath = deriveDirectChildPath(serverDirectory, DATABASE_FILE_NAME)
+      const db = openServerDatabase(
+        databasePath,
+        {
+          deviceFingerprint: server.initialOwner.deviceFingerprint,
+          publicKey: server.initialOwner.publicKey
+        },
+        {
+          serverId: server.serverId,
+          serverPublicKey: server.identity.publicKey
+        }
+      )
+
+      try {
+        return Object.freeze(listChannels(db))
+      } finally {
+        db.close()
+      }
     }
   })
+
+  /**
+   * Owner-only channel mutations. The actor fingerprint is an authenticated fact from
+   * the outer connection; ownership is revalidated against persisted state on every call.
+   */
+  async function mutateChannelTable(
+    localStorageId: string,
+    actorFingerprint: string,
+    operation: (db: DatabaseSync, authorization: VerifiedMemberAuthorization) => void | ServerChannel
+  ): Promise<ServerChannel | undefined> {
+    assertValidStorageId(localStorageId)
+    assertServerIdentitySecureStorageAvailable(secureStorage, platform)
+    const rootRealPath = await inspectServersRoot(serversRoot)
+
+    if (!rootRealPath) {
+      throw new LocalServerStorageError('SERVER_NOT_FOUND')
+    }
+
+    const server = await loadLocalServerFromRoot(
+      serversRoot,
+      rootRealPath,
+      localStorageId,
+      secureStorage,
+      platform
+    )
+    const serverDirectory = deriveDirectChildPath(serversRoot, localStorageId)
+    const databasePath = deriveDirectChildPath(serverDirectory, DATABASE_FILE_NAME)
+    const db = openServerDatabase(
+      databasePath,
+      {
+        deviceFingerprint: server.initialOwner.deviceFingerprint,
+        publicKey: server.initialOwner.publicKey
+      },
+      {
+        serverId: server.serverId,
+        serverPublicKey: server.identity.publicKey
+      }
+    )
+
+    try {
+      const authorization = verifyPersistedMemberAuthorization(
+        db,
+        server.serverId,
+        server.identity.publicKey,
+        {
+          deviceFingerprint: server.initialOwner.deviceFingerprint,
+          publicKey: server.initialOwner.publicKey
+        },
+        actorFingerprint
+      )
+      const result = operation(db, authorization)
+      return result === undefined ? undefined : result
+    } finally {
+      db.close()
+    }
+  }
 }
 
 function deriveServersRoot(userDataDirectory: string): string {

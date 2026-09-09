@@ -5,6 +5,7 @@ import {
   type KeyObject
 } from 'node:crypto'
 import { open, stat } from 'node:fs/promises'
+import { randomUUID } from 'node:crypto'
 import { DatabaseSync } from 'node:sqlite'
 
 import type { InitialOwnerDeviceIdentity } from './initial-owner-binding'
@@ -20,10 +21,12 @@ import {
 } from './server-invite'
 
 export const DATABASE_FILE_NAME = 'server.db'
-export const DATABASE_SCHEMA_VERSION = 4
+export const DATABASE_SCHEMA_VERSION = 5
 export const MAX_INITIAL_SERVER_DATABASE_BYTES = 1024 * 1024 // 1 MB
 export const MIN_SERVER_DATABASE_BYTES = 512
 export const MAX_MEMBERS_LIST_LIMIT = 1000
+export const MAX_CHANNELS_PER_SERVER = 128
+export const MAX_CHANNEL_NAME_CODE_POINTS = 100
 export const SECRET_HASH_BYTES = 32
 const MAX_PUBLIC_KEY_BYTES = 256
 const SQLITE_HEADER = Buffer.from('SQLite format 3\0', 'utf8')
@@ -53,6 +56,11 @@ export type ServerDatabaseErrorCode =
   | 'SERVER_MEMBER_ALREADY_EXISTS'
   | 'SERVER_ADMISSION_INVALID_CANDIDATE'
   | 'SERVER_ADMISSION_FAILED'
+  | 'SERVER_CHANNEL_INVALID'
+  | 'SERVER_CHANNEL_NOT_FOUND'
+  | 'SERVER_CHANNEL_ALREADY_EXISTS'
+  | 'SERVER_CHANNEL_LIMIT_REACHED'
+  | 'SERVER_CHANNEL_UNAUTHORIZED'
 
 const ERROR_MESSAGES: Record<ServerDatabaseErrorCode, string> = {
   SERVER_DATABASE_NOT_FOUND: 'O banco de dados do servidor não foi encontrado.',
@@ -75,7 +83,12 @@ const ERROR_MESSAGES: Record<ServerDatabaseErrorCode, string> = {
   SERVER_INVITE_INVALID: 'O convite do servidor é inválido.',
   SERVER_MEMBER_ALREADY_EXISTS: 'A identidade do dispositivo candidato já é membro do servidor.',
   SERVER_ADMISSION_INVALID_CANDIDATE: 'A identidade do dispositivo candidato é inválida.',
-  SERVER_ADMISSION_FAILED: 'Não foi possível admitir o novo membro no servidor com segurança.'
+  SERVER_ADMISSION_FAILED: 'Não foi possível admitir o novo membro no servidor com segurança.',
+  SERVER_CHANNEL_INVALID: 'O canal solicitado é inválido.',
+  SERVER_CHANNEL_NOT_FOUND: 'O canal do servidor não foi encontrado.',
+  SERVER_CHANNEL_ALREADY_EXISTS: 'Já existe um canal com esse nome no servidor.',
+  SERVER_CHANNEL_LIMIT_REACHED: 'O servidor atingiu o número máximo de canais.',
+  SERVER_CHANNEL_UNAUTHORIZED: 'Apenas o owner pode gerenciar canais do servidor.'
 }
 
 export class ServerDatabaseError extends Error {
@@ -160,6 +173,16 @@ export function initializeServerDatabase(
         CHECK (uses >= 0),
         CHECK (uses <= max_uses),
         CHECK (revoked IN (0, 1))
+      );
+
+      CREATE TABLE channels (
+        channel_id TEXT PRIMARY KEY,
+        name TEXT NOT NULL UNIQUE,
+        created_at INTEGER NOT NULL,
+        created_by TEXT NOT NULL
+          REFERENCES members(device_fingerprint)
+          ON DELETE RESTRICT,
+        archived INTEGER NOT NULL CHECK (archived IN (0, 1))
       );
     `)
 
@@ -317,41 +340,55 @@ function validateDatabaseIntegrityAndSchema(
     throw new ServerDatabaseError('SERVER_DATABASE_VERSION_UNSUPPORTED')
   }
 
-  // Migração segura de v3 -> v4 se elegível (apenas Initial Owner)
-  if (version === 3) {
-    if (!expectedOwner) {
+  // Migração atômica de versões legadas (v3/v4) até v5. Commit somente após a
+  // validação completa do banco final; qualquer falha preserva os bytes originais.
+  if (version === 3 || version === 4) {
+    if (version === 3 && !expectedOwner) {
       throw new ServerDatabaseError('SERVER_DATABASE_SCHEMA_INVALID')
     }
 
-    // Executa migração atômica para v4
     db.exec('BEGIN IMMEDIATE;')
     try {
-      const v3Members = db.prepare('SELECT device_fingerprint, device_public_key FROM members;').all()
-      if (v3Members.length !== 1) {
-        throw new ServerDatabaseError('SERVER_MEMBERSHIP_MIGRATION_REQUIRES_READMISSION')
-      }
+      if (version === 3) {
+        const v3Members = db.prepare('SELECT device_fingerprint, device_public_key FROM members;').all()
+        if (v3Members.length !== 1) {
+          throw new ServerDatabaseError('SERVER_MEMBERSHIP_MIGRATION_REQUIRES_READMISSION')
+        }
 
-      const ownerMember = parseAndValidateMemberRow(v3Members[0])
-      if (
-        ownerMember.deviceFingerprint !== expectedOwner.deviceFingerprint ||
-        !ownerMember.publicKey.equals(expectedOwner.publicKey)
-      ) {
-        throw new ServerDatabaseError('SERVER_MEMBERSHIP_STATE_INVALID')
+        const ownerMember = parseAndValidateMemberRow(v3Members[0])
+        if (
+          ownerMember.deviceFingerprint !== expectedOwner!.deviceFingerprint ||
+          !ownerMember.publicKey.equals(expectedOwner!.publicKey)
+        ) {
+          throw new ServerDatabaseError('SERVER_MEMBERSHIP_STATE_INVALID')
+        }
+
+        db.exec(`
+          CREATE TABLE member_certificates (
+            device_fingerprint TEXT PRIMARY KEY
+              REFERENCES members(device_fingerprint)
+              ON DELETE RESTRICT,
+            certificate_version INTEGER NOT NULL
+              CHECK (certificate_version = 1),
+            admission_invite_id TEXT NOT NULL,
+            signature BLOB NOT NULL
+          );
+        `)
       }
 
       db.exec(`
-        CREATE TABLE member_certificates (
-          device_fingerprint TEXT PRIMARY KEY
+        CREATE TABLE channels (
+          channel_id TEXT PRIMARY KEY,
+          name TEXT NOT NULL UNIQUE,
+          created_at INTEGER NOT NULL,
+          created_by TEXT NOT NULL
             REFERENCES members(device_fingerprint)
             ON DELETE RESTRICT,
-          certificate_version INTEGER NOT NULL
-            CHECK (certificate_version = 1),
-          admission_invite_id TEXT NOT NULL,
-          signature BLOB NOT NULL
+          archived INTEGER NOT NULL CHECK (archived IN (0, 1))
         );
       `)
-      db.exec('PRAGMA user_version = 4;')
-      // Validate the complete v4 schema and data before making the migration durable.
+      db.exec(`PRAGMA user_version = ${DATABASE_SCHEMA_VERSION};`)
+      // Validate the complete v5 schema and data before making the migration durable.
       validateDatabaseIntegrityAndSchema(db, expectedOwner, serverContext)
       db.exec('COMMIT;')
       return
@@ -361,28 +398,34 @@ function validateDatabaseIntegrityAndSchema(
       } catch {
         // Ignora
       }
+      // Preserve the original semantic code (e.g. invite validation) so callers and
+      // tests can distinguish failure causes; the database keeps its original bytes.
+      if (error instanceof ServerDatabaseError) throw error
       throw databaseWriteError(error, 'SERVER_DATABASE_SCHEMA_INVALID')
     }
   } else if (version !== DATABASE_SCHEMA_VERSION) {
     throw new ServerDatabaseError('SERVER_DATABASE_SCHEMA_INVALID')
   }
 
-  // Allowlist estrita de schema v4: exatamente 3 tabelas (invites, member_certificates, members)
+  // Allowlist estrita de schema v5: exatamente 4 tabelas (channels, invites, member_certificates, members)
   const schemaObjects = db
     .prepare("SELECT type, name, tbl_name FROM sqlite_schema WHERE name NOT GLOB 'sqlite_*' ORDER BY name ASC;")
     .all() as Array<{ type?: unknown; name?: unknown; tbl_name?: unknown }>
 
   if (
-    schemaObjects.length !== 3 ||
+    schemaObjects.length !== 4 ||
     schemaObjects[0]?.type !== 'table' ||
-    schemaObjects[0]?.name !== 'invites' ||
-    schemaObjects[0]?.tbl_name !== 'invites' ||
+    schemaObjects[0]?.name !== 'channels' ||
+    schemaObjects[0]?.tbl_name !== 'channels' ||
     schemaObjects[1]?.type !== 'table' ||
-    schemaObjects[1]?.name !== 'member_certificates' ||
-    schemaObjects[1]?.tbl_name !== 'member_certificates' ||
+    schemaObjects[1]?.name !== 'invites' ||
+    schemaObjects[1]?.tbl_name !== 'invites' ||
     schemaObjects[2]?.type !== 'table' ||
-    schemaObjects[2]?.name !== 'members' ||
-    schemaObjects[2]?.tbl_name !== 'members'
+    schemaObjects[2]?.name !== 'member_certificates' ||
+    schemaObjects[2]?.tbl_name !== 'member_certificates' ||
+    schemaObjects[3]?.type !== 'table' ||
+    schemaObjects[3]?.name !== 'members' ||
+    schemaObjects[3]?.tbl_name !== 'members'
   ) {
     throw new ServerDatabaseError('SERVER_DATABASE_SCHEMA_INVALID')
   }
@@ -416,6 +459,15 @@ function validateDatabaseIntegrityAndSchema(
 
   for (const row of allInvites) {
     parseAndValidateStoredInviteRow(row)
+  }
+
+  // Valida todos os registros presentes na tabela channels
+  const allChannels = db
+    .prepare('SELECT channel_id, name, created_at, created_by, archived FROM channels ORDER BY name ASC;')
+    .all()
+
+  for (const row of allChannels) {
+    parseAndValidateChannelRow(row, memberMap)
   }
 
   // Se um expectedOwner foi especificado, valida a consistência de ownership e cardinalidade exata de certificados
@@ -1054,6 +1106,269 @@ function validatePublicKeyDer(
   }
 
   return canonicalDer
+}
+
+// ---------------------------------------------------------------------------
+// Channels (ETAPA 8.2)
+// ---------------------------------------------------------------------------
+
+export interface ServerChannel {
+  readonly channelId: string
+  readonly name: string
+  readonly createdAt: number
+  readonly createdBy: string
+  readonly archived: boolean
+}
+
+interface RawStoredChannelRow {
+  readonly channel_id: string
+  readonly name: string
+  readonly created_at: number
+  readonly created_by: string
+  readonly archived: number
+}
+
+function parseAndValidateChannelRow(row: unknown, memberMap?: Map<string, Member>): ServerChannel {
+  if (!isRecord(row)) {
+    throw new ServerDatabaseError('SERVER_DATABASE_SCHEMA_INVALID')
+  }
+
+  const { channel_id, name, created_at, created_by, archived } = row as Record<string, unknown>
+
+  if (
+    typeof channel_id !== 'string' || !HEX_32_PATTERN.test(channel_id) ||
+    typeof name !== 'string' ||
+    typeof created_at !== 'number' || !Number.isInteger(created_at) ||
+    created_at < 0 || created_at > 4_102_444_800 ||
+    typeof created_by !== 'string' || !FINGERPRINT_PATTERN.test(created_by) ||
+    typeof archived !== 'number' || (archived !== 0 && archived !== 1)
+  ) {
+    throw new ServerDatabaseError('SERVER_DATABASE_SCHEMA_INVALID')
+  }
+
+  assertValidChannelName(name)
+
+  if (memberMap && !memberMap.has(created_by)) {
+    throw new ServerDatabaseError('SERVER_DATABASE_SCHEMA_INVALID')
+  }
+
+  return Object.freeze({
+    channelId: channel_id,
+    name,
+    createdAt: created_at,
+    createdBy: created_by,
+    archived: archived === 1
+  })
+}
+
+export function assertValidChannelName(name: string): void {
+  if (
+    typeof name !== 'string' ||
+    name.length === 0 ||
+    name.trim().length === 0 ||
+    [...name].length > MAX_CHANNEL_NAME_CODE_POINTS ||
+    name.normalize('NFC') !== name
+  ) {
+    throw new ServerDatabaseError('SERVER_CHANNEL_INVALID')
+  }
+
+  for (let index = 0; index < name.length; index++) {
+    const unit = name.charCodeAt(index)
+    if (unit <= 0x1f || (unit >= 0x7f && unit <= 0x9f)) {
+      throw new ServerDatabaseError('SERVER_CHANNEL_INVALID')
+    }
+  }
+}
+
+export function listChannels(db: DatabaseSync, limit: number = MAX_CHANNELS_PER_SERVER): ServerChannel[] {
+  const boundedLimit = Math.min(Math.max(1, limit), MAX_CHANNELS_PER_SERVER)
+  const rows = db
+    .prepare('SELECT channel_id, name, created_at, created_by, archived FROM channels ORDER BY name COLLATE BINARY ASC, channel_id ASC LIMIT ?;')
+    .all(boundedLimit) as unknown as RawStoredChannelRow[]
+
+  return rows.map((row) => parseAndValidateChannelRow(row))
+}
+
+export function getChannelByName(db: DatabaseSync, name: string): ServerChannel | undefined {
+  assertValidChannelName(name)
+  const row = db
+    .prepare('SELECT channel_id, name, created_at, created_by, archived FROM channels WHERE name = ?;')
+    .get(name)
+
+  return row === undefined ? undefined : parseAndValidateChannelRow(row)
+}
+
+export function createChannel(
+  db: DatabaseSync,
+  options: {
+    readonly name: string
+    readonly actorFingerprint: string
+    readonly isOwner: boolean
+    readonly channelId?: string
+    readonly nowSeconds?: number
+  }
+): ServerChannel {
+  assertValidChannelName(options.name)
+  if (!FINGERPRINT_PATTERN.test(options.actorFingerprint) || !options.isOwner) {
+    throw new ServerDatabaseError('SERVER_CHANNEL_UNAUTHORIZED')
+  }
+
+  const channelId = options.channelId ?? randomUUID().replaceAll('-', '')
+  if (!HEX_32_PATTERN.test(channelId)) {
+    throw new ServerDatabaseError('SERVER_CHANNEL_INVALID')
+  }
+  const createdAt = options.nowSeconds ?? Math.floor(Date.now() / 1000)
+
+  db.exec('BEGIN IMMEDIATE;')
+  try {
+    const total = db.prepare('SELECT COUNT(*) AS count FROM channels;').get() as { count: number }
+    if (total.count >= MAX_CHANNELS_PER_SERVER) {
+      throw new ServerDatabaseError('SERVER_CHANNEL_LIMIT_REACHED')
+    }
+
+    if (getChannelByName(db, options.name)) {
+      throw new ServerDatabaseError('SERVER_CHANNEL_ALREADY_EXISTS')
+    }
+
+    db.prepare(`
+      INSERT INTO channels (channel_id, name, created_at, created_by, archived)
+      VALUES (?, ?, ?, ?, 0);
+    `).run(channelId, options.name, createdAt, options.actorFingerprint)
+
+    const row = db
+      .prepare('SELECT channel_id, name, created_at, created_by, archived FROM channels WHERE channel_id = ?;')
+      .get(channelId)
+    if (!row) {
+      throw new ServerDatabaseError('SERVER_CHANNEL_INVALID')
+    }
+    const channel = parseAndValidateChannelRow(row)
+    db.exec('COMMIT;')
+    return channel
+  } catch (error) {
+    try {
+      db.exec('ROLLBACK;')
+    } catch {
+      // Ignora
+    }
+    if (error instanceof ServerDatabaseError) throw error
+    // UNIQUE constraint (errcode 19) backstop for concurrent same-name inserts.
+    if (isRecord(error) && error.errcode === 19) {
+      throw new ServerDatabaseError('SERVER_CHANNEL_ALREADY_EXISTS')
+    }
+    throw databaseWriteError(error, 'SERVER_CHANNEL_INVALID')
+  }
+}
+
+export function renameChannel(
+  db: DatabaseSync,
+  options: {
+    readonly channelId: string
+    readonly name: string
+    readonly actorFingerprint: string
+    readonly isOwner: boolean
+  }
+): ServerChannel {
+  assertValidChannelName(options.name)
+  if (!HEX_32_PATTERN.test(options.channelId) || !options.isOwner) {
+    throw new ServerDatabaseError('SERVER_CHANNEL_UNAUTHORIZED')
+  }
+
+  db.exec('BEGIN IMMEDIATE;')
+  try {
+    const result = db
+      .prepare('UPDATE channels SET name = ? WHERE channel_id = ?;')
+      .run(options.name, options.channelId) as { changes?: number | bigint }
+    if (result.changes !== 1) {
+      throw new ServerDatabaseError('SERVER_CHANNEL_NOT_FOUND')
+    }
+    const row = db
+      .prepare('SELECT channel_id, name, created_at, created_by, archived FROM channels WHERE channel_id = ?;')
+      .get(options.channelId)
+    if (!row) {
+      throw new ServerDatabaseError('SERVER_CHANNEL_NOT_FOUND')
+    }
+    const channel = parseAndValidateChannelRow(row)
+    db.exec('COMMIT;')
+    return channel
+  } catch (error) {
+    try {
+      db.exec('ROLLBACK;')
+    } catch {
+      // Ignora
+    }
+    throw databaseWriteError(error, 'SERVER_CHANNEL_INVALID')
+  }
+}
+
+export function setChannelArchived(
+  db: DatabaseSync,
+  options: {
+    readonly channelId: string
+    readonly archived: boolean
+    readonly actorFingerprint: string
+    readonly isOwner: boolean
+  }
+): ServerChannel {
+  if (!HEX_32_PATTERN.test(options.channelId) || !options.isOwner) {
+    throw new ServerDatabaseError('SERVER_CHANNEL_UNAUTHORIZED')
+  }
+
+  db.exec('BEGIN IMMEDIATE;')
+  try {
+    const result = db
+      .prepare('UPDATE channels SET archived = ? WHERE channel_id = ?;')
+      .run(options.archived ? 1 : 0, options.channelId) as { changes?: number | bigint }
+    if (result.changes !== 1) {
+      throw new ServerDatabaseError('SERVER_CHANNEL_NOT_FOUND')
+    }
+    const row = db
+      .prepare('SELECT channel_id, name, created_at, created_by, archived FROM channels WHERE channel_id = ?;')
+      .get(options.channelId)
+    if (!row) {
+      throw new ServerDatabaseError('SERVER_CHANNEL_NOT_FOUND')
+    }
+    const channel = parseAndValidateChannelRow(row)
+    db.exec('COMMIT;')
+    return channel
+  } catch (error) {
+    try {
+      db.exec('ROLLBACK;')
+    } catch {
+      // Ignora
+    }
+    throw databaseWriteError(error, 'SERVER_CHANNEL_INVALID')
+  }
+}
+
+export function deleteChannel(
+  db: DatabaseSync,
+  options: {
+    readonly channelId: string
+    readonly actorFingerprint: string
+    readonly isOwner: boolean
+  }
+): void {
+  if (!HEX_32_PATTERN.test(options.channelId) || !options.isOwner) {
+    throw new ServerDatabaseError('SERVER_CHANNEL_UNAUTHORIZED')
+  }
+
+  db.exec('BEGIN IMMEDIATE;')
+  try {
+    const result = db
+      .prepare('DELETE FROM channels WHERE channel_id = ?;')
+      .run(options.channelId) as { changes?: number | bigint }
+    if (result.changes !== 1) {
+      throw new ServerDatabaseError('SERVER_CHANNEL_NOT_FOUND')
+    }
+    db.exec('COMMIT;')
+  } catch (error) {
+    try {
+      db.exec('ROLLBACK;')
+    } catch {
+      // Ignora
+    }
+    throw databaseWriteError(error, 'SERVER_CHANNEL_INVALID')
+  }
 }
 
 function databaseWriteError(error: unknown, fallback: ServerDatabaseErrorCode): ServerDatabaseError {

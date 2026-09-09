@@ -436,6 +436,85 @@ async function createServerFixture() {
   }
 }
 
+describe('canais na fachada de storage (ETAPA 8.2)', () => {
+  it('permite fluxo completo de canal para o owner autenticado', async () => {
+    const fixture = await createServerFixture()
+    const ownerFingerprint = TEST_DEVICE_IDENTITY.fingerprint
+
+    const created = await fixture.storage.createLocalServerChannel(FIRST_ID, {
+      name: 'Geral', actorFingerprint: ownerFingerprint
+    })
+    expect(created.name).toBe('Geral')
+    expect(created.archived).toBe(false)
+
+    const renamed = await fixture.storage.renameLocalServerChannel(FIRST_ID, {
+      channelId: created.channelId, name: 'Anúncios', actorFingerprint: ownerFingerprint
+    })
+    expect(renamed.name).toBe('Anúncios')
+
+    const archived = await fixture.storage.setLocalServerChannelArchived(FIRST_ID, {
+      channelId: created.channelId, archived: true, actorFingerprint: ownerFingerprint
+    })
+    expect(archived.archived).toBe(true)
+
+    expect(await fixture.storage.listLocalServerChannels(FIRST_ID)).toEqual([archived])
+
+    await fixture.storage.deleteLocalServerChannel(FIRST_ID, {
+      channelId: created.channelId, actorFingerprint: ownerFingerprint
+    })
+    expect(await fixture.storage.listLocalServerChannels(FIRST_ID)).toEqual([])
+  })
+
+  it('rejeita mutação por ator não autorizado mesmo com canal existente', async () => {
+    const fixture = await createServerFixture()
+    const ownerFingerprint = TEST_DEVICE_IDENTITY.fingerprint
+    const created = await fixture.storage.createLocalServerChannel(FIRST_ID, {
+      name: 'Geral', actorFingerprint: ownerFingerprint
+    })
+
+    await expectStorageError(
+      fixture.storage.createLocalServerChannel(FIRST_ID, {
+        name: 'Intruso', actorFingerprint: 'sha256:' + 'f'.repeat(64)
+      }),
+      'SERVER_CHANNEL_UNAUTHORIZED'
+    )
+    await expectStorageError(
+      fixture.storage.renameLocalServerChannel(FIRST_ID, {
+        channelId: created.channelId, name: 'Sequestrado', actorFingerprint: 'sha256:' + 'f'.repeat(64)
+      }),
+      'SERVER_CHANNEL_UNAUTHORIZED'
+    )
+    await expectStorageError(
+      fixture.storage.deleteLocalServerChannel(FIRST_ID, {
+        channelId: created.channelId, actorFingerprint: 'sha256:' + 'f'.repeat(64)
+      }),
+      'SERVER_CHANNEL_UNAUTHORIZED'
+    )
+    expect(await fixture.storage.listLocalServerChannels(FIRST_ID)).toEqual([created])
+  })
+
+  it('rejeita nomes de canal inválidos e duplicados na fachada', async () => {
+    const fixture = await createServerFixture()
+    const ownerFingerprint = TEST_DEVICE_IDENTITY.fingerprint
+    await fixture.storage.createLocalServerChannel(FIRST_ID, {
+      name: 'Geral', actorFingerprint: ownerFingerprint
+    })
+
+    await expectStorageError(
+      fixture.storage.createLocalServerChannel(FIRST_ID, {
+        name: '', actorFingerprint: ownerFingerprint
+      }),
+      'SERVER_CHANNEL_INVALID'
+    )
+    await expectStorageError(
+      fixture.storage.createLocalServerChannel(FIRST_ID, {
+        name: 'Geral', actorFingerprint: ownerFingerprint
+      }),
+      'SERVER_CHANNEL_ALREADY_EXISTS'
+    )
+  })
+})
+
 async function writeMetadata(path: string, metadata: Record<string, unknown>): Promise<void> {
   await writeFile(path, JSON.stringify(metadata))
 }
