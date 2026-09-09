@@ -21,12 +21,16 @@ import {
 } from './server-invite'
 
 export const DATABASE_FILE_NAME = 'server.db'
-export const DATABASE_SCHEMA_VERSION = 5
+export const DATABASE_SCHEMA_VERSION = 6
 export const MAX_INITIAL_SERVER_DATABASE_BYTES = 1024 * 1024 // 1 MB
 export const MIN_SERVER_DATABASE_BYTES = 512
 export const MAX_MEMBERS_LIST_LIMIT = 1000
 export const MAX_CHANNELS_PER_SERVER = 128
 export const MAX_CHANNEL_NAME_CODE_POINTS = 100
+export const MAX_MESSAGES_PER_CHANNEL = 2000
+export const MAX_MESSAGE_CONTENT_CODE_POINTS = 4096
+export const MAX_MESSAGE_LIST_LIMIT = 500
+export const DEFAULT_MESSAGE_LIST_LIMIT = 100
 export const SECRET_HASH_BYTES = 32
 const MAX_PUBLIC_KEY_BYTES = 256
 const SQLITE_HEADER = Buffer.from('SQLite format 3\0', 'utf8')
@@ -61,6 +65,13 @@ export type ServerDatabaseErrorCode =
   | 'SERVER_CHANNEL_ALREADY_EXISTS'
   | 'SERVER_CHANNEL_LIMIT_REACHED'
   | 'SERVER_CHANNEL_UNAUTHORIZED'
+  | 'SERVER_CHANNEL_ARCHIVED'
+  | 'SERVER_MESSAGE_INVALID'
+  | 'SERVER_MESSAGE_NOT_FOUND'
+  | 'SERVER_MESSAGE_FORBIDDEN'
+  | 'SERVER_MESSAGE_CAPACITY_REACHED'
+  | 'SERVER_MESSAGE_DUPLICATE'
+  | 'SERVER_MESSAGE_DUPLICATE'
 
 const ERROR_MESSAGES: Record<ServerDatabaseErrorCode, string> = {
   SERVER_DATABASE_NOT_FOUND: 'O banco de dados do servidor não foi encontrado.',
@@ -88,7 +99,13 @@ const ERROR_MESSAGES: Record<ServerDatabaseErrorCode, string> = {
   SERVER_CHANNEL_NOT_FOUND: 'O canal do servidor não foi encontrado.',
   SERVER_CHANNEL_ALREADY_EXISTS: 'Já existe um canal com esse nome no servidor.',
   SERVER_CHANNEL_LIMIT_REACHED: 'O servidor atingiu o número máximo de canais.',
-  SERVER_CHANNEL_UNAUTHORIZED: 'Apenas o owner pode gerenciar canais do servidor.'
+  SERVER_CHANNEL_UNAUTHORIZED: 'Apenas o owner pode gerenciar canais do servidor.',
+  SERVER_CHANNEL_ARCHIVED: 'O canal está arquivado e não aceita novas mensagens.',
+  SERVER_MESSAGE_INVALID: 'A mensagem solicitada é inválida.',
+  SERVER_MESSAGE_NOT_FOUND: 'A mensagem do servidor não foi encontrada.',
+  SERVER_MESSAGE_FORBIDDEN: 'A operação de mensagem não é permitida para este membro.',
+  SERVER_MESSAGE_CAPACITY_REACHED: 'O canal atingiu o número máximo de mensagens vivas.',
+  SERVER_MESSAGE_DUPLICATE: 'A mensagem duplicada já foi registrada para este canal.'
 }
 
 export class ServerDatabaseError extends Error {
@@ -184,6 +201,29 @@ export function initializeServerDatabase(
           ON DELETE RESTRICT,
         archived INTEGER NOT NULL CHECK (archived IN (0, 1))
       );
+
+      CREATE TABLE messages (
+        channel_id TEXT NOT NULL
+          REFERENCES channels(channel_id)
+          ON DELETE RESTRICT,
+        sequence INTEGER NOT NULL,
+        message_id TEXT PRIMARY KEY,
+        client_message_id TEXT NOT NULL UNIQUE,
+        author_fingerprint TEXT NOT NULL
+          REFERENCES members(device_fingerprint)
+          ON DELETE RESTRICT,
+        content TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        edited_at INTEGER,
+        deleted_at INTEGER,
+        CHECK (sequence >= 1),
+        CHECK (created_at >= 0),
+        CHECK (deleted_at IS NULL OR deleted_at >= created_at),
+        CHECK (edited_at IS NULL OR edited_at >= created_at),
+        UNIQUE (channel_id, sequence)
+      );
+
+      CREATE INDEX messages_channel_sequence ON messages(channel_id, sequence);
     `)
 
     db.prepare(`
@@ -340,9 +380,9 @@ function validateDatabaseIntegrityAndSchema(
     throw new ServerDatabaseError('SERVER_DATABASE_VERSION_UNSUPPORTED')
   }
 
-  // Migração atômica de versões legadas (v3/v4) até v5. Commit somente após a
+  // Migração atômica de versões legadas (v3/v4/v5) até v6. Commit somente após a
   // validação completa do banco final; qualquer falha preserva os bytes originais.
-  if (version === 3 || version === 4) {
+  if (version === 3 || version === 4 || version === 5) {
     if (version === 3 && !expectedOwner) {
       throw new ServerDatabaseError('SERVER_DATABASE_SCHEMA_INVALID')
     }
@@ -376,19 +416,46 @@ function validateDatabaseIntegrityAndSchema(
         `)
       }
 
+      if (version === 3 || version === 4) {
+        db.exec(`
+          CREATE TABLE channels (
+            channel_id TEXT PRIMARY KEY,
+            name TEXT NOT NULL UNIQUE,
+            created_at INTEGER NOT NULL,
+            created_by TEXT NOT NULL
+              REFERENCES members(device_fingerprint)
+              ON DELETE RESTRICT,
+            archived INTEGER NOT NULL CHECK (archived IN (0, 1))
+          );
+        `)
+      }
+
       db.exec(`
-        CREATE TABLE channels (
-          channel_id TEXT PRIMARY KEY,
-          name TEXT NOT NULL UNIQUE,
-          created_at INTEGER NOT NULL,
-          created_by TEXT NOT NULL
+        CREATE TABLE messages (
+          channel_id TEXT NOT NULL
+            REFERENCES channels(channel_id)
+            ON DELETE RESTRICT,
+          sequence INTEGER NOT NULL,
+          message_id TEXT PRIMARY KEY,
+          client_message_id TEXT NOT NULL UNIQUE,
+          author_fingerprint TEXT NOT NULL
             REFERENCES members(device_fingerprint)
             ON DELETE RESTRICT,
-          archived INTEGER NOT NULL CHECK (archived IN (0, 1))
+          content TEXT NOT NULL,
+          created_at INTEGER NOT NULL,
+          edited_at INTEGER,
+          deleted_at INTEGER,
+          CHECK (sequence >= 1),
+          CHECK (created_at >= 0),
+          CHECK (deleted_at IS NULL OR deleted_at >= created_at),
+          CHECK (edited_at IS NULL OR edited_at >= created_at),
+          UNIQUE (channel_id, sequence)
         );
+
+        CREATE INDEX messages_channel_sequence ON messages(channel_id, sequence);
       `)
       db.exec(`PRAGMA user_version = ${DATABASE_SCHEMA_VERSION};`)
-      // Validate the complete v5 schema and data before making the migration durable.
+      // Validate the complete final schema and data before making the migration durable.
       validateDatabaseIntegrityAndSchema(db, expectedOwner, serverContext)
       db.exec('COMMIT;')
       return
@@ -407,25 +474,30 @@ function validateDatabaseIntegrityAndSchema(
     throw new ServerDatabaseError('SERVER_DATABASE_SCHEMA_INVALID')
   }
 
-  // Allowlist estrita de schema v5: exatamente 4 tabelas (channels, invites, member_certificates, members)
+  // Allowlist estrita de schema v6: exatamente 5 tabelas (channels, invites, member_certificates, members, messages)
+  // e exatamente 1 índice (messages_channel_sequence). Objetos sqlite_* continuam excluídos.
   const schemaObjects = db
     .prepare("SELECT type, name, tbl_name FROM sqlite_schema WHERE name NOT GLOB 'sqlite_*' ORDER BY name ASC;")
     .all() as Array<{ type?: unknown; name?: unknown; tbl_name?: unknown }>
 
+  const tables = schemaObjects.filter((object) => object.type === 'table')
+  const indexes = schemaObjects.filter((object) => object.type === 'index')
+
+  const isTable = (object: { type?: unknown; name?: unknown; tbl_name?: unknown } | undefined, name: string): boolean =>
+    object?.name === name && object?.tbl_name === name
+
   if (
-    schemaObjects.length !== 4 ||
-    schemaObjects[0]?.type !== 'table' ||
-    schemaObjects[0]?.name !== 'channels' ||
-    schemaObjects[0]?.tbl_name !== 'channels' ||
-    schemaObjects[1]?.type !== 'table' ||
-    schemaObjects[1]?.name !== 'invites' ||
-    schemaObjects[1]?.tbl_name !== 'invites' ||
-    schemaObjects[2]?.type !== 'table' ||
-    schemaObjects[2]?.name !== 'member_certificates' ||
-    schemaObjects[2]?.tbl_name !== 'member_certificates' ||
-    schemaObjects[3]?.type !== 'table' ||
-    schemaObjects[3]?.name !== 'members' ||
-    schemaObjects[3]?.tbl_name !== 'members'
+    tables.length !== 5 ||
+    !isTable(tables[0], 'channels') ||
+    !isTable(tables[1], 'invites') ||
+    !isTable(tables[2], 'member_certificates') ||
+    !isTable(tables[3], 'members') ||
+    !isTable(tables[4], 'messages') ||
+    indexes.length !== 1 ||
+    indexes[0]?.name !== 'messages_channel_sequence' ||
+    indexes[0]?.tbl_name !== 'messages' ||
+    schemaObjects.length !== tables.length + indexes.length ||
+    schemaObjects.some((object) => object.type !== 'table' && object.type !== 'index')
   ) {
     throw new ServerDatabaseError('SERVER_DATABASE_SCHEMA_INVALID')
   }
@@ -1251,8 +1323,8 @@ export function createChannel(
       // Ignora
     }
     if (error instanceof ServerDatabaseError) throw error
-    // UNIQUE constraint (errcode 19) backstop for concurrent same-name inserts.
-    if (isRecord(error) && error.errcode === 19) {
+    // UNIQUE constraint backstop for concurrent same-name inserts.
+    if (isSqliteConstraintError(error)) {
       throw new ServerDatabaseError('SERVER_CHANNEL_ALREADY_EXISTS')
     }
     throw databaseWriteError(error, 'SERVER_CHANNEL_INVALID')
@@ -1367,14 +1439,386 @@ export function deleteChannel(
     } catch {
       // Ignora
     }
+    if (error instanceof ServerDatabaseError) throw error
+    if (isRecord(error) && error.errcode === 19) {
+      // Messages reference the channel with ON DELETE RESTRICT.
+      throw new ServerDatabaseError('SERVER_DATABASE_INITIALIZATION_FAILED')
+    }
     throw databaseWriteError(error, 'SERVER_CHANNEL_INVALID')
   }
 }
 
+// ---------------------------------------------------------------------------
+// Messages (ETAPA 8.3)
+// ---------------------------------------------------------------------------
+
+export interface ServerMessage {
+  readonly channelId: string
+  readonly sequence: number
+  readonly messageId: string
+  readonly clientMessageId: string
+  readonly authorFingerprint: string
+  readonly content: string
+  readonly createdAt: number
+  readonly editedAt: number | null
+  readonly deletedAt: number | null
+}
+
+export interface MessageOperationAuthorization {
+  readonly actorFingerprint: string
+  readonly isOwner: boolean
+}
+
+export function createMessageOperationAuthorization(options: {
+  readonly actorFingerprint: string
+  readonly isAuthorized: boolean
+  readonly isOwner: boolean
+}): MessageOperationAuthorization {
+  if (
+    typeof options.actorFingerprint !== 'string' ||
+    !FINGERPRINT_PATTERN.test(options.actorFingerprint) ||
+    !options.isAuthorized
+  ) {
+    throw new ServerDatabaseError('SERVER_MESSAGE_FORBIDDEN')
+  }
+
+  return Object.freeze({
+    actorFingerprint: options.actorFingerprint,
+    isOwner: options.isOwner === true
+  })
+}
+
+interface RawStoredMessageRow {
+  readonly channel_id: string
+  readonly sequence: number
+  readonly message_id: string
+  readonly client_message_id: string
+  readonly author_fingerprint: string
+  readonly content: string
+  readonly created_at: number
+  readonly edited_at: number | null
+  readonly deleted_at: number | null
+}
+
+const MESSAGE_COLUMNS = 'channel_id, sequence, message_id, client_message_id, author_fingerprint, content, created_at, edited_at, deleted_at'
+
+function listMemberMap(db: DatabaseSync): Map<string, Member> {
+  const memberMap = new Map<string, Member>()
+  for (const row of db.prepare('SELECT device_fingerprint, device_public_key FROM members;').all()) {
+    const member = parseAndValidateMemberRow(row)
+    memberMap.set(member.deviceFingerprint, member)
+  }
+  return memberMap
+}
+
+function parseAndValidateMessageRow(row: unknown, memberMap: Map<string, Member>): ServerMessage {
+  if (!isRecord(row)) {
+    throw new ServerDatabaseError('SERVER_DATABASE_SCHEMA_INVALID')
+  }
+
+  const {
+    channel_id, sequence, message_id, client_message_id, author_fingerprint,
+    content, created_at, edited_at, deleted_at
+  } = row as Record<string, unknown>
+
+  if (
+    typeof channel_id !== 'string' || !HEX_32_PATTERN.test(channel_id) ||
+    typeof sequence !== 'number' || !Number.isSafeInteger(sequence) || sequence < 1 ||
+    typeof message_id !== 'string' || !HEX_32_PATTERN.test(message_id) ||
+    typeof client_message_id !== 'string' || !HEX_32_PATTERN.test(client_message_id) ||
+    typeof author_fingerprint !== 'string' || !FINGERPRINT_PATTERN.test(author_fingerprint) ||
+    typeof content !== 'string' ||
+    typeof created_at !== 'number' || !Number.isInteger(created_at) || created_at < 0 ||
+    (edited_at !== null && (typeof edited_at !== 'number' || !Number.isInteger(edited_at) || edited_at < created_at)) ||
+    (deleted_at !== null && (typeof deleted_at !== 'number' || !Number.isInteger(deleted_at) || deleted_at < created_at))
+  ) {
+    throw new ServerDatabaseError('SERVER_DATABASE_SCHEMA_INVALID')
+  }
+
+  if (content.length > MAX_MESSAGE_CONTENT_CODE_POINTS || !memberMap.has(author_fingerprint)) {
+    throw new ServerDatabaseError('SERVER_DATABASE_SCHEMA_INVALID')
+  }
+
+  return Object.freeze({
+    channelId: channel_id,
+    sequence,
+    messageId: message_id,
+    clientMessageId: client_message_id,
+    authorFingerprint: author_fingerprint,
+    content,
+    createdAt: created_at,
+    editedAt: typeof edited_at === 'number' ? edited_at : null,
+    deletedAt: typeof deleted_at === 'number' ? deleted_at : null
+  })
+}
+
+function getChannelForMessageOperation(db: DatabaseSync, channelId: string, options: { readonly requireActive: boolean } = { requireActive: false }): void {
+  if (!HEX_32_PATTERN.test(channelId)) {
+    throw new ServerDatabaseError('SERVER_MESSAGE_NOT_FOUND')
+  }
+
+  const row = db
+    .prepare('SELECT channel_id, name, created_at, created_by, archived FROM channels WHERE channel_id = ?;')
+    .get(channelId)
+
+  if (!row) {
+    throw new ServerDatabaseError('SERVER_MESSAGE_NOT_FOUND')
+  }
+
+  const channel = parseAndValidateChannelRow(row)
+  if (options.requireActive && channel.archived) {
+    throw new ServerDatabaseError('SERVER_CHANNEL_ARCHIVED')
+  }
+}
+
+function assertValidMessageContent(content: string): void {
+  if (
+    typeof content !== 'string' ||
+    content.length === 0 ||
+    [...content].length > MAX_MESSAGE_CONTENT_CODE_POINTS ||
+    content.normalize('NFC') !== content
+  ) {
+    throw new ServerDatabaseError('SERVER_MESSAGE_INVALID')
+  }
+  for (let index = 0; index < content.length; index++) {
+    const unit = content.charCodeAt(index)
+    if (unit <= 0x1f || (unit >= 0x7f && unit <= 0x9f)) {
+      throw new ServerDatabaseError('SERVER_MESSAGE_INVALID')
+    }
+  }
+}
+
+export function createMessage(
+  db: DatabaseSync,
+  options: {
+    readonly channelId: string
+    readonly content: string
+    readonly clientMessageId: string
+    readonly authorization: MessageOperationAuthorization
+    readonly messageId?: string
+    readonly nowSeconds?: number
+  }
+): ServerMessage {
+  getChannelForMessageOperation(db, options.channelId, { requireActive: true })
+  assertValidMessageContent(options.content)
+  if (!HEX_32_PATTERN.test(options.clientMessageId)) {
+    throw new ServerDatabaseError('SERVER_MESSAGE_INVALID')
+  }
+
+  const messageId = options.messageId ?? randomUUID().replaceAll('-', '')
+  if (!HEX_32_PATTERN.test(messageId)) {
+    throw new ServerDatabaseError('SERVER_MESSAGE_INVALID')
+  }
+  const createdAt = options.nowSeconds ?? Math.floor(Date.now() / 1000)
+
+  db.exec('BEGIN IMMEDIATE;')
+  try {
+    const duplicate = db
+      .prepare(`SELECT ${MESSAGE_COLUMNS} FROM messages WHERE channel_id = ? AND client_message_id = ?;`)
+      .get(options.channelId, options.clientMessageId)
+
+    if (duplicate) {
+      throw new ServerDatabaseError('SERVER_MESSAGE_DUPLICATE')
+    }
+
+    const capacityRow = db
+      .prepare('SELECT COUNT(*) AS count FROM messages WHERE channel_id = ? AND deleted_at IS NULL;')
+      .get(options.channelId) as { count: number }
+    if (capacityRow.count >= MAX_MESSAGES_PER_CHANNEL) {
+      throw new ServerDatabaseError('SERVER_MESSAGE_CAPACITY_REACHED')
+    }
+
+    const nextSequenceRow = db
+      .prepare('SELECT COALESCE(MAX(sequence), 0) + 1 AS next FROM messages WHERE channel_id = ?;')
+      .get(options.channelId) as { next: number }
+    const sequence = nextSequenceRow.next
+
+    db.prepare(`
+      INSERT INTO messages (channel_id, sequence, message_id, client_message_id, author_fingerprint, content, created_at, edited_at, deleted_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL);
+    `).run(
+      options.channelId, sequence, messageId, options.clientMessageId,
+      options.authorization.actorFingerprint, options.content, createdAt
+    )
+
+    const row = db
+      .prepare(`SELECT ${MESSAGE_COLUMNS} FROM messages WHERE message_id = ?;`)
+      .get(messageId)
+    if (!row) {
+      throw new ServerDatabaseError('SERVER_MESSAGE_INVALID')
+    }
+    const message = parseAndValidateMessageRow(row, listMemberMap(db))
+    db.exec('COMMIT;')
+    return message
+  } catch (error) {
+    try {
+      db.exec('ROLLBACK;')
+    } catch {
+      // Ignora
+    }
+    if (error instanceof ServerDatabaseError) throw error
+    if (isSqliteConstraintError(error)) {
+      // Distinguish the two constraint violations that can reach this insert.
+      if (typeof error.message === 'string' && error.message.includes('FOREIGN KEY')) {
+        throw new ServerDatabaseError('SERVER_MESSAGE_FORBIDDEN')
+      }
+      throw new ServerDatabaseError('SERVER_MESSAGE_DUPLICATE')
+    }
+    throw databaseWriteError(error, 'SERVER_MESSAGE_INVALID')
+  }
+}
+
+export function getMessageById(db: DatabaseSync, messageId: string): ServerMessage | undefined {
+  if (!HEX_32_PATTERN.test(messageId)) {
+    return undefined
+  }
+
+  const row = db
+    .prepare(`SELECT ${MESSAGE_COLUMNS} FROM messages WHERE message_id = ?;`)
+    .get(messageId)
+
+  return row === undefined ? undefined : parseAndValidateMessageRow(row, listMemberMap(db))
+}
+
+export function editMessage(
+  db: DatabaseSync,
+  options: {
+    readonly messageId: string
+    readonly content: string
+    readonly authorization: MessageOperationAuthorization
+    readonly nowSeconds?: number
+  }
+): ServerMessage {
+  assertValidMessageContent(options.content)
+  const editedAt = options.nowSeconds ?? Math.floor(Date.now() / 1000)
+
+  db.exec('BEGIN IMMEDIATE;')
+  try {
+    const existingRow = db
+      .prepare(`SELECT ${MESSAGE_COLUMNS} FROM messages WHERE message_id = ?;`)
+      .get(options.messageId)
+
+    if (!existingRow) {
+      throw new ServerDatabaseError('SERVER_MESSAGE_NOT_FOUND')
+    }
+    const existing = parseAndValidateMessageRow(existingRow, listMemberMap(db))
+    if (existing.deletedAt !== null) {
+      throw new ServerDatabaseError('SERVER_MESSAGE_NOT_FOUND')
+    }
+    if (existing.authorFingerprint !== options.authorization.actorFingerprint) {
+      throw new ServerDatabaseError('SERVER_MESSAGE_FORBIDDEN')
+    }
+
+    db.prepare('UPDATE messages SET content = ?, edited_at = ? WHERE message_id = ?;')
+      .run(options.content, editedAt, options.messageId)
+
+    const row = db
+      .prepare(`SELECT ${MESSAGE_COLUMNS} FROM messages WHERE message_id = ?;`)
+      .get(options.messageId)
+    if (!row) {
+      throw new ServerDatabaseError('SERVER_MESSAGE_NOT_FOUND')
+    }
+    const message = parseAndValidateMessageRow(row, listMemberMap(db))
+    db.exec('COMMIT;')
+    return message
+  } catch (error) {
+    try {
+      db.exec('ROLLBACK;')
+    } catch {
+      // Ignora
+    }
+    if (error instanceof ServerDatabaseError) throw error
+    throw databaseWriteError(error, 'SERVER_MESSAGE_INVALID')
+  }
+}
+
+export function deleteMessage(
+  db: DatabaseSync,
+  options: {
+    readonly messageId: string
+    readonly authorization: MessageOperationAuthorization
+    readonly nowSeconds?: number
+  }
+): ServerMessage {
+  const deletedAt = options.nowSeconds ?? Math.floor(Date.now() / 1000)
+
+  db.exec('BEGIN IMMEDIATE;')
+  try {
+    const existingRow = db
+      .prepare(`SELECT ${MESSAGE_COLUMNS} FROM messages WHERE message_id = ?;`)
+      .get(options.messageId)
+
+    if (!existingRow) {
+      throw new ServerDatabaseError('SERVER_MESSAGE_NOT_FOUND')
+    }
+    const existing = parseAndValidateMessageRow(existingRow, listMemberMap(db))
+    if (existing.deletedAt !== null) {
+      throw new ServerDatabaseError('SERVER_MESSAGE_NOT_FOUND')
+    }
+    if (existing.authorFingerprint !== options.authorization.actorFingerprint && !options.authorization.isOwner) {
+      throw new ServerDatabaseError('SERVER_MESSAGE_FORBIDDEN')
+    }
+
+    db.prepare('UPDATE messages SET content = \'\', deleted_at = ? WHERE message_id = ?;')
+      .run(deletedAt, options.messageId)
+
+    const row = db
+      .prepare(`SELECT ${MESSAGE_COLUMNS} FROM messages WHERE message_id = ?;`)
+      .get(options.messageId)
+    if (!row) {
+      throw new ServerDatabaseError('SERVER_MESSAGE_NOT_FOUND')
+    }
+    const message = parseAndValidateMessageRow(row, listMemberMap(db))
+    db.exec('COMMIT;')
+    return message
+  } catch (error) {
+    try {
+      db.exec('ROLLBACK;')
+    } catch {
+      // Ignora
+    }
+    if (error instanceof ServerDatabaseError) throw error
+    throw databaseWriteError(error, 'SERVER_MESSAGE_INVALID')
+  }
+}
+
+export function listMessages(
+  db: DatabaseSync,
+  options: {
+    readonly channelId: string
+    readonly afterSequence?: number
+    readonly limit?: number
+  }
+): ServerMessage[] {
+  getChannelForMessageOperation(db, options.channelId)
+
+  const boundedLimit = Math.min(
+    Math.max(1, options.limit ?? DEFAULT_MESSAGE_LIST_LIMIT),
+    MAX_MESSAGE_LIST_LIMIT
+  )
+  const after = options.afterSequence ?? 0
+  if (!Number.isSafeInteger(after) || after < 0) {
+    throw new ServerDatabaseError('SERVER_MESSAGE_INVALID')
+  }
+
+  const rows = db
+    .prepare(`SELECT ${MESSAGE_COLUMNS} FROM messages WHERE channel_id = ? AND sequence > ? ORDER BY sequence ASC LIMIT ?;`)
+    .all(options.channelId, after, boundedLimit) as unknown as RawStoredMessageRow[]
+  const memberMap = listMemberMap(db)
+
+  return rows.map((row) => parseAndValidateMessageRow(row, memberMap))
+}
+
+function isSqliteConstraintError(error: unknown): error is Record<string, unknown> {
+  // node:sqlite exposes extended result codes (e.g. 787 FK, 2067 UNIQUE) whose
+  // primary code is always 19 (SQLITE_CONSTRAINT).
+  return isRecord(error) && typeof error.errcode === 'number' && (error.errcode & 0xff) === 19
+}
+
 function databaseWriteError(error: unknown, fallback: ServerDatabaseErrorCode): ServerDatabaseError {
   if (error instanceof ServerDatabaseError) return error
-  // node:sqlite reports SQLITE_FULL with numeric errcode 13.
-  if (isRecord(error) && error.errcode === 13) {
+  // node:sqlite reports SQLITE_FULL (13) possibly as an extended result code.
+  if (isRecord(error) && typeof error.errcode === 'number' && (error.errcode & 0xff) === 13) {
     return new ServerDatabaseError('SERVER_DATABASE_TOO_LARGE')
   }
   return new ServerDatabaseError(fallback)

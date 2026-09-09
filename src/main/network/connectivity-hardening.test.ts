@@ -14,8 +14,8 @@ import { ConnectivityResourceGovernor } from './connectivity-resource-governor'
 import { ConnectivitySubsystem } from './connectivity-subsystem'
 
 describe('phase 7 final hardening invariants', () => {
-  it('keeps schema v5, descriptor v1 and exactly the three established candidate types', () => {
-    expect(DATABASE_SCHEMA_VERSION).toBe(5)
+  it('keeps schema v6, descriptor v1 and exactly the three established candidate types', () => {
+    expect(DATABASE_SCHEMA_VERSION).toBe(6)
     expect(CONNECTIVITY_DESCRIPTOR_VERSION).toBe(1)
     expect(Object.entries(ConnectivityCandidateType)
       .filter(([, value]) => typeof value === 'number')

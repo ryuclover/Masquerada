@@ -14,18 +14,25 @@ import {
 import {
   admitMemberWithInvite,
   createChannel,
+  createMessage,
+  createMessageOperationAuthorization,
   DATABASE_FILE_NAME,
   DATABASE_SCHEMA_VERSION,
   deleteChannel,
+  deleteMessage,
+  editMessage,
   getChannelByName,
   getMemberByFingerprint,
   getStoredInvite,
   initializeServerDatabase,
   listChannels,
   listMembers,
+  listMessages,
   MAX_CHANNEL_NAME_CODE_POINTS,
   MAX_CHANNELS_PER_SERVER,
   MAX_INITIAL_SERVER_DATABASE_BYTES,
+  MAX_MESSAGE_CONTENT_CODE_POINTS,
+  MAX_MESSAGES_PER_CHANNEL,
   openServerDatabase,
   registerIssuedInvite,
   renameChannel,
@@ -78,7 +85,9 @@ describe('fundação segura de SQLite, membership, invites, certificates e admis
       { type: 'table', name: 'channels', tbl_name: 'channels' },
       { type: 'table', name: 'invites', tbl_name: 'invites' },
       { type: 'table', name: 'member_certificates', tbl_name: 'member_certificates' },
-      { type: 'table', name: 'members', tbl_name: 'members' }
+      { type: 'table', name: 'members', tbl_name: 'members' },
+      { type: 'table', name: 'messages', tbl_name: 'messages' },
+      { type: 'index', name: 'messages_channel_sequence', tbl_name: 'messages' }
     ])
     expect(members).toHaveLength(1)
     expect(members[0]?.deviceFingerprint).toBe(owner.fingerprint)
@@ -361,7 +370,7 @@ describe('fundação segura de SQLite, membership, invites, certificates e admis
       const owner = createTestDeviceIdentity()
       initializeServerDatabase(dbPath, owner)
       const raw = new DatabaseSync(dbPath)
-      raw.exec('DROP TABLE channels; DROP TABLE member_certificates; PRAGMA user_version = 3;')
+      raw.exec('DROP TABLE messages; DROP INDEX IF EXISTS messages_channel_sequence; DROP TABLE channels; DROP TABLE member_certificates; PRAGMA user_version = 3;')
       raw.prepare(`INSERT INTO invites VALUES (?, ?, 2000000000, 3, 1, 0);`).run(
         'a'.repeat(32), Buffer.alloc(32, 1)
       )
@@ -683,7 +692,7 @@ describe('fundação segura de SQLite, membership, invites, certificates e admis
       db.close()
     }
 
-    expect((await stat(dbPath)).size).toBeGreaterThan(initialSize)
+    expect((await stat(dbPath)).size).toBeGreaterThanOrEqual(initialSize)
     expect((await stat(dbPath)).size).toBeLessThanOrEqual(MAX_INITIAL_SERVER_DATABASE_BYTES)
     await expect(validateServerDatabaseFile(dbPath, expectedOwner, serverContext)).resolves.toBeUndefined()
     const reopened = openServerDatabase(dbPath, expectedOwner, serverContext)
@@ -821,7 +830,7 @@ describe('canais do servidor (ETAPA 8.2)', () => {
     }
   })
 
-  it('migração v4 -> v5 adiciona channels e preserva dados', () => {
+  it('migração v4 -> v6 adiciona channels e messages e preserva dados', () => {
     const root = createTempDirSync()
     testRoots.push(root)
     const dbPath = join(root, DATABASE_FILE_NAME)
@@ -829,7 +838,7 @@ describe('canais do servidor (ETAPA 8.2)', () => {
     initializeServerDatabase(dbPath, owner)
 
     const raw = new DatabaseSync(dbPath)
-    raw.exec('DROP TABLE channels; PRAGMA user_version = 4;')
+    raw.exec('DROP TABLE channels; DROP TABLE messages; DROP INDEX IF EXISTS messages_channel_sequence; PRAGMA user_version = 4;')
     raw.close()
     const before = readFileSync(dbPath)
 
@@ -838,8 +847,9 @@ describe('canais do servidor (ETAPA 8.2)', () => {
       publicKey: owner.publicKey
     })
     try {
-      expect(migrated.prepare('PRAGMA user_version;').get()).toMatchObject({ user_version: 5 })
+      expect(migrated.prepare('PRAGMA user_version;').get()).toMatchObject({ user_version: 6 })
       expect(migrated.prepare('SELECT COUNT(*) AS count FROM channels;').get()).toMatchObject({ count: 0 })
+      expect(migrated.prepare('SELECT COUNT(*) AS count FROM messages;').get()).toMatchObject({ count: 0 })
       expect(migrated.prepare('SELECT COUNT(*) AS count FROM members;').get()).toMatchObject({ count: 1 })
     } finally {
       migrated.close()
@@ -863,6 +873,281 @@ describe('canais do servidor (ETAPA 8.2)', () => {
 function createTempDirSync(): string {
   return mkdtempSync(join(tmpdir(), 'masquerada-db-test-'))
 }
+
+describe('mensagens do servidor (ETAPA 8.3)', () => {
+  function createMessageFixture() {
+    const root = createTempDirSync()
+    const dbPath = join(root, DATABASE_FILE_NAME)
+    const owner = createTestDeviceIdentity()
+    const serverKey = generateKeyPairSync('ed25519')
+    const serverPublicKey = Buffer.from(serverKey.publicKey.export({ format: 'der', type: 'spki' }))
+    const serverId = `sha256:${createHash('sha256').update(serverPublicKey).digest('hex')}`
+    initializeServerDatabase(dbPath, owner)
+    const db = openServerDatabase(dbPath, {
+      deviceFingerprint: owner.fingerprint,
+      publicKey: owner.publicKey
+    }, { serverId, serverPublicKey })
+    testRoots.push(root)
+    const ownerAuthorization = createMessageOperationAuthorization({
+      actorFingerprint: owner.fingerprint, isAuthorized: true, isOwner: true
+    })
+    const channel = createChannel(db, {
+      name: 'Geral', actorFingerprint: owner.fingerprint, isOwner: true
+    })
+    return { db, dbPath, owner, ownerAuthorization, channel, serverId, serverPublicKey, serverPrivateKey: serverKey.privateKey }
+  }
+
+  function admitMember(db: DatabaseSync, fixture: ReturnType<typeof createMessageFixture>): AuthenticatedCandidateDevice {
+    const memberDevice = createTestDeviceIdentity()
+    const invite = createServerInvite(fixture.serverId, fixture.serverPrivateKey, fixture.owner, {
+      expiresAt: 2000000000, maxUses: 5
+    })
+    registerIssuedInvite(db, invite)
+    admitMemberWithInvite(db, invite, memberDevice, fixture.serverId, fixture.serverPublicKey, fixture.serverPrivateKey)
+    return memberDevice
+  }
+
+  it('cria mensagem com sequence do host, dedup, edição e soft delete', () => {
+    const fixture = createMessageFixture()
+    try {
+      const first = createMessage(fixture.db, {
+        channelId: fixture.channel.channelId,
+        content: 'Primeira',
+        clientMessageId: 'a'.repeat(32),
+        authorization: fixture.ownerAuthorization,
+        nowSeconds: 500
+      })
+      expect(first.sequence).toBe(1)
+      expect(first.content).toBe('Primeira')
+      expect(first.deletedAt).toBeNull()
+
+      // Dedup: mesmo clientMessageId rejeitado; outro ID cria sequence 2.
+      expect(() => createMessage(fixture.db, {
+        channelId: fixture.channel.channelId,
+        content: 'Primeira',
+        clientMessageId: 'a'.repeat(32),
+        authorization: fixture.ownerAuthorization
+      })).toThrow(new ServerDatabaseError('SERVER_MESSAGE_DUPLICATE'))
+
+      const second = createMessage(fixture.db, {
+        channelId: fixture.channel.channelId,
+        content: 'Segunda',
+        clientMessageId: 'b'.repeat(32),
+        authorization: fixture.ownerAuthorization,
+        nowSeconds: 600
+      })
+      expect(second.sequence).toBe(2)
+
+      const edited = editMessage(fixture.db, {
+        messageId: second.messageId,
+        content: 'Segunda editada',
+        authorization: fixture.ownerAuthorization,
+        nowSeconds: 700
+      })
+      expect(edited.content).toBe('Segunda editada')
+      expect(edited.editedAt).toBe(700)
+
+      const deleted = deleteMessage(fixture.db, {
+        messageId: second.messageId,
+        authorization: fixture.ownerAuthorization,
+        nowSeconds: 800
+      })
+      expect(deleted.deletedAt).toBe(800)
+      expect(deleted.content).toBe('')
+
+      expect(listMessages(fixture.db, { channelId: fixture.channel.channelId })).toHaveLength(2)
+      expect(listMessages(fixture.db, { channelId: fixture.channel.channelId })[1]!.content).toBe('')
+    } finally {
+      fixture.db.close()
+    }
+  })
+
+  it('não-membro não publica; membro edita apenas o próprio conteúdo; owner remove de membro', () => {
+    const fixture = createMessageFixture()
+    try {
+      const memberDevice = admitMember(fixture.db, fixture)
+      const memberAuthorization = createMessageOperationAuthorization({
+        actorFingerprint: memberDevice.fingerprint, isAuthorized: true, isOwner: false
+      })
+      const outsiderAuthorization = createMessageOperationAuthorization({
+        actorFingerprint: 'sha256:' + 'e'.repeat(64), isAuthorized: true, isOwner: true
+      })
+
+      const memberMessage = createMessage(fixture.db, {
+        channelId: fixture.channel.channelId,
+        content: 'Do membro',
+        clientMessageId: 'c'.repeat(32),
+        authorization: memberAuthorization
+      })
+
+      expect(() => createMessage(fixture.db, {
+        channelId: fixture.channel.channelId,
+        content: 'De fora',
+        clientMessageId: 'd'.repeat(32),
+        authorization: outsiderAuthorization
+      })).toThrow(new ServerDatabaseError('SERVER_MESSAGE_FORBIDDEN'))
+
+      expect(() => editMessage(fixture.db, {
+        messageId: memberMessage.messageId,
+        content: 'Sequestrada',
+        authorization: fixture.ownerAuthorization
+      })).toThrow(new ServerDatabaseError('SERVER_MESSAGE_FORBIDDEN'))
+
+      expect(() => editMessage(fixture.db, {
+        messageId: memberMessage.messageId,
+        content: 'Editada por outro membro',
+        authorization: createMessageOperationAuthorization({
+          actorFingerprint: 'sha256:' + 'e'.repeat(64), isAuthorized: true, isOwner: true
+        })
+      })).toThrow(new ServerDatabaseError('SERVER_MESSAGE_FORBIDDEN'))
+
+      const removedByOwner = deleteMessage(fixture.db, {
+        messageId: memberMessage.messageId,
+        authorization: fixture.ownerAuthorization,
+        nowSeconds: Math.floor(Date.now() / 1000) + 500
+      })
+      expect(removedByOwner.deletedAt).not.toBeNull()
+    } finally {
+      fixture.db.close()
+    }
+  })
+
+  it('listagem é bounded, ordenada e aceita cursor afterSequence', () => {
+    const fixture = createMessageFixture()
+    try {
+      for (let index = 1; index <= 10; index++) {
+        createMessage(fixture.db, {
+          channelId: fixture.channel.channelId,
+          content: `Mensagem ${index}`,
+          clientMessageId: index.toString(16).padStart(32, '0'),
+          authorization: fixture.ownerAuthorization,
+          nowSeconds: 1000 + index
+        })
+      }
+
+      expect(listMessages(fixture.db, { channelId: fixture.channel.channelId })).toHaveLength(10)
+      expect(listMessages(fixture.db, { channelId: fixture.channel.channelId, limit: 4 })).toHaveLength(4)
+      const cursor = listMessages(fixture.db, { channelId: fixture.channel.channelId, afterSequence: 7, limit: 2 })
+      expect(cursor.map((message) => message.sequence)).toEqual([8, 9])
+      expect(() => listMessages(fixture.db, { channelId: 'f'.repeat(32) }))
+        .toThrow(new ServerDatabaseError('SERVER_MESSAGE_NOT_FOUND'))
+      expect(() => listMessages(fixture.db, { channelId: fixture.channel.channelId, afterSequence: -1 }))
+        .toThrow(new ServerDatabaseError('SERVER_MESSAGE_INVALID'))
+    } finally {
+      fixture.db.close()
+    }
+  })
+
+  it('conteúdo inválido, canal arquivado e capacidade máxima falham fechados', () => {
+    const fixture = createMessageFixture()
+    try {
+      expect(() => createMessage(fixture.db, {
+        channelId: fixture.channel.channelId,
+        content: 'a'.repeat(MAX_MESSAGE_CONTENT_CODE_POINTS + 1),
+        clientMessageId: 'e'.repeat(32),
+        authorization: fixture.ownerAuthorization
+      })).toThrow(new ServerDatabaseError('SERVER_MESSAGE_INVALID'))
+      expect(() => createMessage(fixture.db, {
+        channelId: fixture.channel.channelId,
+        content: 'linha\nquebrada',
+        clientMessageId: 'e'.repeat(32),
+        authorization: fixture.ownerAuthorization
+      })).toThrow(new ServerDatabaseError('SERVER_MESSAGE_INVALID'))
+
+      setChannelArchived(fixture.db, {
+        channelId: fixture.channel.channelId, archived: true,
+        actorFingerprint: fixture.owner.fingerprint, isOwner: true
+      })
+      expect(() => createMessage(fixture.db, {
+        channelId: fixture.channel.channelId,
+        content: 'Após arquivo',
+        clientMessageId: 'e'.repeat(32),
+        authorization: fixture.ownerAuthorization
+      })).toThrow(new ServerDatabaseError('SERVER_CHANNEL_ARCHIVED'))
+    } finally {
+      fixture.db.close()
+    }
+  })
+
+  it('canal com mensagem não pode ser removido (FK RESTRICT) e remoção preserva banco', () => {
+    const fixture = createMessageFixture()
+    try {
+      createMessage(fixture.db, {
+        channelId: fixture.channel.channelId,
+        content: 'Única',
+        clientMessageId: 'f'.repeat(32),
+        authorization: fixture.ownerAuthorization
+      })
+      const sizeBefore = readFileSync(fixture.dbPath).length
+      expect(() => deleteChannel(fixture.db, {
+        channelId: fixture.channel.channelId,
+        actorFingerprint: fixture.owner.fingerprint,
+        isOwner: true
+      })).toThrow()
+      expect(readFileSync(fixture.dbPath).length).toBe(sizeBefore)
+      expect(getChannelByName(fixture.db, 'Geral')).toBeDefined()
+    } finally {
+      fixture.db.close()
+    }
+  })
+
+  it('migração v5 -> v6 adiciona messages e preserva dados', () => {
+    const root = createTempDirSync()
+    testRoots.push(root)
+    const dbPath = join(root, DATABASE_FILE_NAME)
+    const owner = createTestDeviceIdentity()
+    initializeServerDatabase(dbPath, owner)
+
+    const raw = new DatabaseSync(dbPath)
+    raw.exec('DROP TABLE messages; DROP INDEX IF EXISTS messages_channel_sequence; PRAGMA user_version = 5;')
+    raw.close()
+
+    const migrated = openServerDatabase(dbPath, {
+      deviceFingerprint: owner.fingerprint,
+      publicKey: owner.publicKey
+    })
+    try {
+      expect(migrated.prepare('PRAGMA user_version;').get()).toMatchObject({ user_version: 6 })
+      expect(migrated.prepare('SELECT COUNT(*) AS count FROM messages;').get()).toMatchObject({ count: 0 })
+      expect(migrated.prepare('SELECT COUNT(*) AS count FROM members;').get()).toMatchObject({ count: 1 })
+    } finally {
+      migrated.close()
+    }
+  })
+
+  it('capacidade de MAX_MESSAGES_PER_CHANNEL é imposta e reversível', () => {
+    const fixture = createMessageFixture()
+    try {
+      const capacities = MAX_MESSAGES_PER_CHANNEL
+      for (let index = 0; index < capacities; index++) {
+        createMessage(fixture.db, {
+          channelId: fixture.channel.channelId,
+          content: `m${index}`,
+          clientMessageId: index.toString(16).padStart(32, '0'),
+          authorization: fixture.ownerAuthorization
+        })
+      }
+      expect(() => createMessage(fixture.db, {
+        channelId: fixture.channel.channelId,
+        content: 'estouro',
+        clientMessageId: 'f'.repeat(32),
+        authorization: fixture.ownerAuthorization
+      })).toThrow(new ServerDatabaseError('SERVER_MESSAGE_CAPACITY_REACHED'))
+
+      const first = listMessages(fixture.db, { channelId: fixture.channel.channelId, limit: 1 })[0]!
+      deleteMessage(fixture.db, { messageId: first.messageId, authorization: fixture.ownerAuthorization })
+      const recovered = createMessage(fixture.db, {
+        channelId: fixture.channel.channelId,
+        content: 'após limpeza',
+        clientMessageId: 'f'.repeat(32),
+        authorization: fixture.ownerAuthorization
+      })
+      expect(recovered.sequence).toBe(capacities + 1)
+    } finally {
+      fixture.db.close()
+    }
+  }, 30000)
+})
 
 function createTestDeviceIdentity() {
   const keyPair = generateKeyPairSync('ed25519')

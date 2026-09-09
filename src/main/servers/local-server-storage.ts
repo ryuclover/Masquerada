@@ -22,11 +22,17 @@ import {
 } from './initial-owner-binding'
 import {
   createChannel,
+  createMessage,
+  createMessageOperationAuthorization,
   deleteChannel,
+  deleteMessage,
+  editMessage,
   listChannels,
+  listMessages,
   renameChannel,
   setChannelArchived,
   type ServerChannel,
+  type ServerMessage,
   DATABASE_FILE_NAME,
   admitMemberWithInvite,
   consumeServerInvite,
@@ -119,6 +125,12 @@ export type LocalServerStorageErrorCode =
   | 'SERVER_CHANNEL_ALREADY_EXISTS'
   | 'SERVER_CHANNEL_LIMIT_REACHED'
   | 'SERVER_CHANNEL_UNAUTHORIZED'
+  | 'SERVER_CHANNEL_ARCHIVED'
+  | 'SERVER_MESSAGE_INVALID'
+  | 'SERVER_MESSAGE_NOT_FOUND'
+  | 'SERVER_MESSAGE_FORBIDDEN'
+  | 'SERVER_MESSAGE_CAPACITY_REACHED'
+  | 'SERVER_MESSAGE_DUPLICATE'
   | 'SERVER_CREATION_FAILED'
   | 'SERVER_ID_COLLISION_LIMIT'
 
@@ -164,6 +176,12 @@ const ERROR_MESSAGES: Record<LocalServerStorageErrorCode, string> = {
   SERVER_CHANNEL_ALREADY_EXISTS: 'Já existe um canal com esse nome no servidor.',
   SERVER_CHANNEL_LIMIT_REACHED: 'O servidor atingiu o número máximo de canais.',
   SERVER_CHANNEL_UNAUTHORIZED: 'Apenas o owner pode gerenciar canais do servidor.',
+  SERVER_CHANNEL_ARCHIVED: 'O canal está arquivado e não aceita novas mensagens.',
+  SERVER_MESSAGE_INVALID: 'A mensagem solicitada é inválida.',
+  SERVER_MESSAGE_NOT_FOUND: 'A mensagem do servidor não foi encontrada.',
+  SERVER_MESSAGE_FORBIDDEN: 'A operação de mensagem não é permitida para este membro.',
+  SERVER_MESSAGE_CAPACITY_REACHED: 'O canal atingiu o número máximo de mensagens vivas.',
+  SERVER_MESSAGE_DUPLICATE: 'A mensagem duplicada já foi registrada para este canal.',
   SERVER_CREATION_FAILED: 'Não foi possível criar o servidor local com segurança.',
   SERVER_ID_COLLISION_LIMIT: 'Não foi possível reservar um identificador local único.'
 }
@@ -734,6 +752,121 @@ export function createLocalServerStorage(
       } finally {
         db.close()
       }
+    },
+
+    createLocalServerMessage: async (
+      localStorageId: string,
+      options: {
+        readonly channelId: string
+        readonly content: string
+        readonly clientMessageId: string
+        readonly actorFingerprint: string
+        readonly nowSeconds?: number
+      }
+    ): Promise<ServerMessage> => {
+      const message = await mutateMessageTable(localStorageId, options.actorFingerprint, (db, authorization) =>
+        createMessage(db, {
+          channelId: options.channelId,
+          content: options.content,
+          clientMessageId: options.clientMessageId,
+          authorization: createMessageOperationAuthorization({
+            actorFingerprint: options.actorFingerprint,
+            isAuthorized: authorization.isAuthorized,
+            isOwner: authorization.isOwner
+          }),
+          nowSeconds: options.nowSeconds
+        })
+      )
+      return message!
+    },
+
+    editLocalServerMessage: async (
+      localStorageId: string,
+      options: {
+        readonly messageId: string
+        readonly content: string
+        readonly actorFingerprint: string
+        readonly nowSeconds?: number
+      }
+    ): Promise<ServerMessage> => {
+      const message = await mutateMessageTable(localStorageId, options.actorFingerprint, (db, authorization) =>
+        editMessage(db, {
+          messageId: options.messageId,
+          content: options.content,
+          authorization: createMessageOperationAuthorization({
+            actorFingerprint: options.actorFingerprint,
+            isAuthorized: authorization.isAuthorized,
+            isOwner: authorization.isOwner
+          }),
+          nowSeconds: options.nowSeconds
+        })
+      )
+      return message!
+    },
+
+    deleteLocalServerMessage: async (
+      localStorageId: string,
+      options: {
+        readonly messageId: string
+        readonly actorFingerprint: string
+        readonly nowSeconds?: number
+      }
+    ): Promise<ServerMessage> => {
+      const message = await mutateMessageTable(localStorageId, options.actorFingerprint, (db, authorization) =>
+        deleteMessage(db, {
+          messageId: options.messageId,
+          authorization: createMessageOperationAuthorization({
+            actorFingerprint: options.actorFingerprint,
+            isAuthorized: authorization.isAuthorized,
+            isOwner: authorization.isOwner
+          }),
+          nowSeconds: options.nowSeconds
+        })
+      )
+      return message!
+    },
+
+    listLocalServerMessages: async (
+      localStorageId: string,
+      options: {
+        readonly channelId: string
+        readonly afterSequence?: number
+        readonly limit?: number
+      }
+    ): Promise<readonly ServerMessage[]> => {
+      assertValidStorageId(localStorageId)
+      const rootRealPath = await inspectServersRoot(serversRoot)
+
+      if (!rootRealPath) {
+        throw new LocalServerStorageError('SERVER_NOT_FOUND')
+      }
+
+      const server = await loadLocalServerFromRoot(
+        serversRoot,
+        rootRealPath,
+        localStorageId,
+        secureStorage,
+        platform
+      )
+      const serverDirectory = deriveDirectChildPath(serversRoot, localStorageId)
+      const databasePath = deriveDirectChildPath(serverDirectory, DATABASE_FILE_NAME)
+      const db = openServerDatabase(
+        databasePath,
+        {
+          deviceFingerprint: server.initialOwner.deviceFingerprint,
+          publicKey: server.initialOwner.publicKey
+        },
+        {
+          serverId: server.serverId,
+          serverPublicKey: server.identity.publicKey
+        }
+      )
+
+      try {
+        return Object.freeze(listMessages(db, options))
+      } finally {
+        db.close()
+      }
     }
   })
 
@@ -788,6 +921,61 @@ export function createLocalServerStorage(
       )
       const result = operation(db, authorization)
       return result === undefined ? undefined : result
+    } finally {
+      db.close()
+    }
+  }
+
+  /**
+   * Authorized-member message mutations. The actor fingerprint is an authenticated
+   * fact from the outer connection; authorization is revalidated on every call.
+   */
+  async function mutateMessageTable(
+    localStorageId: string,
+    actorFingerprint: string,
+    operation: (db: DatabaseSync, authorization: VerifiedMemberAuthorization) => ServerMessage
+  ): Promise<ServerMessage | undefined> {
+    assertValidStorageId(localStorageId)
+    assertServerIdentitySecureStorageAvailable(secureStorage, platform)
+    const rootRealPath = await inspectServersRoot(serversRoot)
+
+    if (!rootRealPath) {
+      throw new LocalServerStorageError('SERVER_NOT_FOUND')
+    }
+
+    const server = await loadLocalServerFromRoot(
+      serversRoot,
+      rootRealPath,
+      localStorageId,
+      secureStorage,
+      platform
+    )
+    const serverDirectory = deriveDirectChildPath(serversRoot, localStorageId)
+    const databasePath = deriveDirectChildPath(serverDirectory, DATABASE_FILE_NAME)
+    const db = openServerDatabase(
+      databasePath,
+      {
+        deviceFingerprint: server.initialOwner.deviceFingerprint,
+        publicKey: server.initialOwner.publicKey
+      },
+      {
+        serverId: server.serverId,
+        serverPublicKey: server.identity.publicKey
+      }
+    )
+
+    try {
+      const authorization = verifyPersistedMemberAuthorization(
+        db,
+        server.serverId,
+        server.identity.publicKey,
+        {
+          deviceFingerprint: server.initialOwner.deviceFingerprint,
+          publicKey: server.initialOwner.publicKey
+        },
+        actorFingerprint
+      )
+      return operation(db, authorization)
     } finally {
       db.close()
     }
