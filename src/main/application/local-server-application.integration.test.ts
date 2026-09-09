@@ -197,4 +197,81 @@ describe('local application over an authorized secure connection', () => {
       harness.close()
     }
   })
+
+  it('paginates history by cursor with host-assigned sequences and revalidates membership per request', async () => {
+    const host = await connectFixture()
+    const channelIds = await host.storage.listLocalServerChannels(host.server.localStorageId)
+    expect(channelIds).toEqual([])
+
+    // Seed a channel with several messages as the owner.
+    const ownerFingerprint = host.server.initialOwner.deviceFingerprint
+    const created = await host.storage.createLocalServerChannel(host.server.localStorageId, {
+      name: 'Geral', actorFingerprint: ownerFingerprint
+    })
+    const createdIds: string[] = []
+    for (let index = 1; index <= 5; index++) {
+      const message = await host.storage.createLocalServerMessage(host.server.localStorageId, {
+        channelId: created.channelId,
+        content: `Mensagem ${index}`,
+        clientMessageId: index.toString(16).padStart(32, '0'),
+        actorFingerprint: ownerFingerprint
+      })
+      createdIds.push(message.messageId)
+    }
+
+    const firstPage = await host.application.requestHistory({
+      channelId: created.channelId, afterSequence: 0, limit: 2
+    })
+    expect(firstPage.messages.map((message) => message.sequence)).toEqual([1, 2])
+    expect(firstPage.messages[0]!.content).toBe('Mensagem 1')
+    expect(firstPage.hasMore).toBe(true)
+
+    const secondPage = await host.application.requestHistory({
+      channelId: created.channelId, afterSequence: 2, limit: 2
+    })
+    expect(secondPage.messages.map((message) => message.sequence)).toEqual([3, 4])
+    expect(secondPage.hasMore).toBe(true)
+
+    const thirdPage = await host.application.requestHistory({
+      channelId: created.channelId, afterSequence: 4, limit: 2
+    })
+    expect(thirdPage.messages.map((message) => message.sequence)).toEqual([5])
+    expect(thirdPage.hasMore).toBe(false)
+
+    // Deleted messages surface as tombstones with empty content.
+    await host.storage.deleteLocalServerMessage(host.server.localStorageId, {
+      messageId: createdIds[2]!, actorFingerprint: ownerFingerprint
+    })
+    const afterDelete = await host.application.requestHistory({
+      channelId: created.channelId, afterSequence: 2, limit: 1
+    })
+    expect(afterDelete.messages[0]!.content).toBe('')
+    expect(afterDelete.messages[0]!.deletedAt).not.toBeNull()
+
+    // Non-members cannot read history even with a still-authorized channel.
+    const db = openServerDatabase(join(host.root, 'servers', host.server.localStorageId, DATABASE_FILE_NAME))
+    try {
+      db.exec('BEGIN IMMEDIATE;')
+      db.prepare('DELETE FROM member_certificates WHERE device_fingerprint = ?').run(host.member.fingerprint)
+      db.prepare('DELETE FROM members WHERE device_fingerprint = ?').run(host.member.fingerprint)
+      db.exec('COMMIT;')
+    } finally {
+      db.close()
+    }
+    await expect(host.application.requestHistory({
+      channelId: created.channelId, afterSequence: 0, limit: 10
+    })).rejects.toBeDefined()
+
+    // Channel ids from a peer never select a storage path: unknown channel is a safe miss.
+    await expect(host.application.requestHistory({
+      channelId: 'f'.repeat(32), afterSequence: 0, limit: 10
+    })).rejects.toBeDefined()
+  })
+
+  it('rejects history requests above the wire batch limit and unknown message types', async () => {
+    const host = await connectFixture()
+    await expect(host.application.requestHistory({
+      channelId: 'a'.repeat(32), afterSequence: 0, limit: 101
+    })).rejects.toBeDefined()
+  })
 })

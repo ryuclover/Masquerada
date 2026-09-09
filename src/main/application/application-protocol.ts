@@ -20,6 +20,33 @@ export type ServerStateResponsePayload =
     }
   | { status: 'error'; code: 'UNAVAILABLE' }
 
+export interface HistoryWireMessage {
+  sequence: number
+  messageId: string
+  authorFingerprint: string
+  content: string
+  createdAt: number
+  editedAt: number | null
+  deletedAt: number | null
+}
+
+export interface HistoryQuery {
+  channelId: string
+  afterSequence: number
+  limit: number
+}
+
+export type HistoryResponsePayload =
+  | {
+      status: 'ok'
+      messages: readonly HistoryWireMessage[]
+      hasMore: boolean
+    }
+  | { status: 'error'; code: 'UNAVAILABLE' }
+
+export const MAX_HISTORY_BATCH = 100
+export const MAX_MESSAGE_CONTENT_CODE_POINTS_WIRE = 4096
+
 export type ApplicationEnvelope = {
   messageId: string
   serverId: string
@@ -27,17 +54,17 @@ export type ApplicationEnvelope = {
 } & (
   | {
       kind: 'request'
-      messageType: 'server-state.request'
+      messageType: 'server-state.request' | 'history.request'
       correlationId: null
       sequence: null
-      payload: Record<string, never>
+      payload: Record<string, never> | HistoryQuery
     }
   | {
       kind: 'response'
-      messageType: 'server-state.response'
+      messageType: 'server-state.response' | 'history.response'
       correlationId: string
       sequence: number
-      payload: ServerStateResponsePayload
+      payload: ServerStateResponsePayload | HistoryResponsePayload
     }
 )
 
@@ -158,18 +185,41 @@ function validate(value: Json): asserts value is Json & ApplicationEnvelope {
   if (envelopePayload === undefined) invalid()
   const payload = record(envelopePayload)
   if (envelope.kind === 'request') {
-    if (
-      envelope.messageType !== 'server-state.request' ||
-      envelope.correlationId !== null || envelope.sequence !== null
-    ) invalid()
-    exactKeys(payload, [])
-    return
+    if (envelope.correlationId !== null || envelope.sequence !== null) invalid()
+    if (envelope.messageType === 'server-state.request') {
+      exactKeys(payload, [])
+      return
+    }
+    if (envelope.messageType === 'history.request') {
+      exactKeys(payload, ['channelId', 'afterSequence', 'limit'])
+      if (
+        typeof payload.channelId !== 'string' || !ID.test(payload.channelId) ||
+        typeof payload.afterSequence !== 'number' || !Number.isSafeInteger(payload.afterSequence) ||
+        payload.afterSequence < 0 ||
+        typeof payload.limit !== 'number' || !Number.isSafeInteger(payload.limit) ||
+        payload.limit < 1 || payload.limit > MAX_HISTORY_BATCH
+      ) invalid()
+      return
+    }
+    invalid()
   }
   if (
-    envelope.kind !== 'response' || envelope.messageType !== 'server-state.response' ||
+    envelope.kind !== 'response' ||
     typeof envelope.correlationId !== 'string' || !ID.test(envelope.correlationId) ||
     typeof envelope.sequence !== 'number' || envelope.sequence <= 0
   ) invalid()
+  if (envelope.messageType === 'server-state.response') {
+    validateServerStateResponse(payload)
+    return
+  }
+  if (envelope.messageType === 'history.response') {
+    validateHistoryResponse(payload)
+    return
+  }
+  invalid()
+}
+
+function validateServerStateResponse(payload: { [key: string]: Json }): void {
   if (payload.status === 'error') {
     exactKeys(payload, ['status', 'code'])
     if (payload.code !== 'UNAVAILABLE') invalid()
@@ -178,7 +228,7 @@ function validate(value: Json): asserts value is Json & ApplicationEnvelope {
   exactKeys(payload, ['status', 'server', 'channels'])
   if (payload.status !== 'ok') invalid()
   const serverValue: Json | undefined = payload.server
-  if (serverValue === undefined) invalid()
+  if (serverValue === undefined || serverValue === null) invalid()
   const server = record(serverValue)
   exactKeys(server, ['displayName'])
   const displayName = server.displayName
@@ -197,6 +247,46 @@ function validate(value: Json): asserts value is Json & ApplicationEnvelope {
     ) invalid()
     previous = channelId
     text(channelName, 128)
+  }
+}
+
+function validateHistoryResponse(payload: { [key: string]: Json }): void {
+  if (payload.status === 'error') {
+    exactKeys(payload, ['status', 'code'])
+    if (payload.code !== 'UNAVAILABLE') invalid()
+    return
+  }
+  exactKeys(payload, ['status', 'messages', 'hasMore'])
+  if (payload.status !== 'ok') invalid()
+  if (typeof payload.hasMore !== 'boolean') invalid()
+  if (!Array.isArray(payload.messages) || payload.messages.length > MAX_HISTORY_BATCH) invalid()
+  let previousSequence = 0
+  for (const entry of payload.messages) {
+    const message = record(entry)
+    exactKeys(message, ['sequence', 'messageId', 'authorFingerprint', 'content', 'createdAt', 'editedAt', 'deletedAt'])
+    const { sequence, messageId, authorFingerprint, content, createdAt, editedAt, deletedAt } = message
+    if (
+      typeof sequence !== 'number' || !Number.isSafeInteger(sequence) || sequence < 1 ||
+      sequence <= previousSequence ||
+      typeof messageId !== 'string' || !ID.test(messageId) ||
+      typeof authorFingerprint !== 'string' || !SERVER_ID.test(authorFingerprint) ||
+      typeof createdAt !== 'number' || !Number.isInteger(createdAt) || createdAt < 0 ||
+      (editedAt !== null && (typeof editedAt !== 'number' || !Number.isInteger(editedAt))) ||
+      (deletedAt !== null && (typeof deletedAt !== 'number' || !Number.isInteger(deletedAt)))
+    ) invalid()
+    previousSequence = sequence
+    const contentValue: Json | undefined = content
+    if (contentValue === undefined || contentValue === null) invalid()
+    // Tombstones (deletedAt set) carry empty content by design.
+    historyContent(contentValue, MAX_MESSAGE_CONTENT_CODE_POINTS_WIRE, deletedAt !== null)
+  }
+}
+
+function historyContent(value: Json, maxCodePoints: number, allowEmpty: boolean): void {
+  if (typeof value !== 'string' || (!allowEmpty && value.length === 0) || [...value].length > maxCodePoints) invalid()
+  for (let index = 0; index < value.length; index++) {
+    const unit = value.charCodeAt(index)
+    if (unit <= 0x1f || (unit >= 0x7f && unit <= 0x9f)) invalid()
   }
 }
 

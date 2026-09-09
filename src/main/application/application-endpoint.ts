@@ -7,6 +7,9 @@ import {
   decodeApplicationEnvelope,
   encodeApplicationEnvelope,
   type ApplicationEnvelope,
+  type HistoryQuery,
+  type HistoryResponsePayload,
+  type HistoryWireMessage,
   type ServerState,
   type ServerStateResponsePayload
 } from './application-protocol'
@@ -96,6 +99,7 @@ interface EndpointOptions {
 
 export function createApplicationClient(options: EndpointOptions & { expectedServerId: string }): {
   requestServerState(options?: { signal?: AbortSignal; timeoutMs?: number }): Promise<ServerState>
+  requestHistory(query: HistoryQuery, options?: { signal?: AbortSignal; timeoutMs?: number }): Promise<{ messages: readonly HistoryWireMessage[]; hasMore: boolean }>
   close(): void
 } {
   const { channel, expectedServerId, resources = sharedResources } = options
@@ -106,7 +110,7 @@ export function createApplicationClient(options: EndpointOptions & { expectedSer
   const responseIds = new Map<string, number>()
   const pending = new Map<string, {
     deadline: number
-    finish(error?: ApplicationEndpointError, state?: ServerState): void
+    finish(error?: ApplicationEndpointError, result?: ServerState | { messages: readonly HistoryWireMessage[]; hasMore: boolean }): void
   }>()
   let closed = false
   let sequence = 0
@@ -142,17 +146,25 @@ export function createApplicationClient(options: EndpointOptions & { expectedSer
       request.finish(new ApplicationEndpointError('TIMEOUT'))
     } else if (envelope.payload.status === 'error') {
       request.finish(new ApplicationEndpointError('UNAVAILABLE'))
-    } else {
+    } else if (envelope.payload.status === 'ok' && 'server' in envelope.payload) {
       request.finish(undefined, {
         displayName: envelope.payload.server.displayName,
         channels: envelope.payload.channels
+      })
+    } else if (envelope.payload.status === 'ok' && 'messages' in envelope.payload) {
+      request.finish(undefined, {
+        messages: envelope.payload.messages,
+        hasMore: envelope.payload.hasMore
       })
     }
   })
   removeClose = channel.onClose(close)
 
-  function requestServerState(requestOptions: { signal?: AbortSignal; timeoutMs?: number } = {}): Promise<ServerState> {
-    if (closed) return Promise.reject(new ApplicationEndpointError('CLOSED'))
+  function issueRequest<P extends 'server-state' | 'history'>(
+    messageType: `${P}.request`,
+    payload: Record<string, never> | HistoryQuery,
+    requestOptions: { signal?: AbortSignal; timeoutMs?: number }
+  ): Promise<ServerState | { messages: readonly HistoryWireMessage[]; hasMore: boolean }> {
     const { signal, timeoutMs = DEADLINE_MS } = requestOptions
     if (!Number.isFinite(timeoutMs) || timeoutMs <= 0 || timeoutMs > DEADLINE_MS) {
       return Promise.reject(new ApplicationEndpointError('INVALID_TIMEOUT'))
@@ -161,14 +173,14 @@ export function createApplicationClient(options: EndpointOptions & { expectedSer
     if (pending.size >= 8 || !resources.acquireClient()) {
       return Promise.reject(new ApplicationEndpointError('RESOURCE_LIMIT'))
     }
-    return new Promise<ServerState>((resolve, reject) => {
+    return new Promise((resolve, reject) => {
       let finished = false
       let timer: ReturnType<typeof setTimeout> | undefined
       let messageId: string | undefined
       let registered = false
       const deadline = now() + timeoutMs
       const abort = (): void => finish(new ApplicationEndpointError('ABORTED'))
-      function finish(error?: ApplicationEndpointError, state?: ServerState): void {
+      function finish(error?: ApplicationEndpointError, result?: ServerState | { messages: readonly HistoryWireMessage[]; hasMore: boolean }): void {
         if (finished) return
         finished = true
         if (timer !== undefined) clearTimeout(timer)
@@ -176,16 +188,17 @@ export function createApplicationClient(options: EndpointOptions & { expectedSer
         if (registered) pending.delete(messageId!)
         resources.releaseClient()
         if (error) reject(error)
-        else resolve(state!)
+        else resolve(result!)
       }
       try {
         messageId = createApplicationMessageId()
         if (pending.has(messageId)) throw new ApplicationProtocolError('DUPLICATE_MESSAGE_ID')
         remember(requestIds, messageId, now())
         const frame = encodeApplicationEnvelope({
-          kind: 'request', messageType: 'server-state.request', messageId,
-          correlationId: null, serverId: expectedServerId, channelId: null, sequence: null, payload: {}
-        })
+          kind: 'request', messageType, messageId,
+          correlationId: null, serverId: expectedServerId, channelId: null, sequence: null,
+          payload
+        } as ApplicationEnvelope)
         pending.set(messageId, { deadline, finish })
         registered = true
         timer = setTimeout(() => finish(new ApplicationEndpointError('TIMEOUT')), timeoutMs)
@@ -206,14 +219,33 @@ export function createApplicationClient(options: EndpointOptions & { expectedSer
     })
   }
 
-  return { requestServerState, close }
+  function requestServerState(requestOptions: { signal?: AbortSignal; timeoutMs?: number } = {}): Promise<ServerState> {
+    if (closed) return Promise.reject(new ApplicationEndpointError('CLOSED'))
+    return issueRequest('server-state.request', {}, requestOptions) as Promise<ServerState>
+  }
+
+  function requestHistory(
+    query: HistoryQuery,
+    requestOptions: { signal?: AbortSignal; timeoutMs?: number } = {}
+  ): Promise<{ messages: readonly HistoryWireMessage[]; hasMore: boolean }> {
+    if (closed) return Promise.reject(new ApplicationEndpointError('CLOSED'))
+    return issueRequest('history.request', query, requestOptions) as Promise<{ messages: readonly HistoryWireMessage[]; hasMore: boolean }>
+  }
+
+  return { requestServerState, requestHistory, close }
 }
 
 type ReadContext = Readonly<{ serverId: string; peerDeviceFingerprint: string }>
 
+export interface HistoryPage {
+  readonly messages: readonly HistoryWireMessage[]
+  readonly hasMore: boolean
+}
+
 export function createApplicationHost(options: EndpointOptions & {
   serverId: string
   readServerState: (context: ReadContext, signal: AbortSignal) => Promise<ServerState>
+  readServerHistory?: (context: ReadContext, query: HistoryQuery, signal: AbortSignal) => Promise<HistoryPage>
   authorizeServerStateRead: (context: ReadContext, signal: AbortSignal) => Promise<void>
 }): { close(): void } {
   const { channel, serverId, resources = sharedResources } = options
@@ -247,16 +279,21 @@ export function createApplicationHost(options: EndpointOptions & {
     recentIds.clear()
   }
 
-  function sendResponse(request: ApplicationEnvelope & { kind: 'request' }, payload: ServerStateResponsePayload, deadline: number): void {
+  function sendResponse(
+    request: ApplicationEnvelope & { kind: 'request' },
+    payload: ServerStateResponsePayload | HistoryResponsePayload,
+    deadline: number
+  ): void {
     if (closed || now() >= deadline) return
     if (sequence === Number.MAX_SAFE_INTEGER) {
       close()
       return
     }
     const frame = encodeApplicationEnvelope({
-      kind: 'response', messageType: 'server-state.response', messageId: createApplicationMessageId(),
+      kind: 'response', messageType: request.messageType === 'history.request' ? 'history.response' : 'server-state.response',
+      messageId: createApplicationMessageId(),
       correlationId: request.messageId, serverId, channelId: null, sequence: sequence + 1, payload
-    })
+    } as ApplicationEnvelope)
     if (closed || now() >= deadline) return
     sequence++
     // Do not await peer dispatch: a peer can issue its next request during this send.
@@ -277,11 +314,35 @@ export function createApplicationHost(options: EndpointOptions & {
       if (!live()) return
       await options.authorizeServerStateRead(context, operation.controller.signal)
       if (!live()) return
-      const state = await options.readServerState(context, operation.controller.signal)
-      if (!live()) return
-      await options.authorizeServerStateRead(context, operation.controller.signal)
-      if (!live()) return
-      sendResponse(request, { status: 'ok', server: { displayName: state.displayName }, channels: state.channels }, deadline)
+      let payload: ServerStateResponsePayload | HistoryResponsePayload
+      if (request.messageType === 'history.request') {
+        const query = request.payload as HistoryQuery
+        const page = await options.readServerHistory!(context, query, operation.controller.signal)
+        if (!live()) return
+        await options.authorizeServerStateRead(context, operation.controller.signal)
+        if (!live()) return
+        // Deterministic batch reduction keeps large contents under the wire payload limit.
+        let messages = page.messages
+        for (;;) {
+          payload = { status: 'ok', messages, hasMore: page.hasMore || messages.length < page.messages.length }
+          try {
+            sendResponse(request, payload, deadline)
+            return
+          } catch (error) {
+            const oversize = error instanceof ApplicationProtocolError &&
+              (error.code === 'APPLICATION_PAYLOAD_TOO_LARGE' || error.code === 'APPLICATION_BODY_TOO_LARGE')
+            if (!oversize || messages.length <= 1) throw error
+            messages = messages.slice(0, Math.ceil(messages.length / 2))
+          }
+        }
+      } else {
+        const state = await options.readServerState(context, operation.controller.signal)
+        if (!live()) return
+        await options.authorizeServerStateRead(context, operation.controller.signal)
+        if (!live()) return
+        payload = { status: 'ok', server: { displayName: state.displayName }, channels: state.channels }
+      }
+      sendResponse(request, payload, deadline)
     } catch {
       if (live()) {
         try { sendResponse(request, { status: 'error', code: 'UNAVAILABLE' }, deadline) }
@@ -302,6 +363,9 @@ export function createApplicationHost(options: EndpointOptions & {
     const request = decodeApplicationEnvelope(frame)
     if (request.kind !== 'request' || request.serverId !== serverId) {
       throw new ApplicationProtocolError('INVALID_SCOPE_OR_DIRECTION')
+    }
+    if (request.messageType === 'history.request' && !options.readServerHistory) {
+      throw new ApplicationProtocolError('UNSUPPORTED_MESSAGE_TYPE')
     }
     remember(recentIds, request.messageId, time)
     if (!requestRate.take(time) || !resources.takeHostRequest(time)) {

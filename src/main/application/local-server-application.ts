@@ -1,6 +1,6 @@
 import { isAuthorizedPeerChannel, type AuthorizedPeerChannel } from '../network/tcp-transport'
 import type { LocalServerStorage } from '../servers/local-server-storage'
-import { ApplicationEndpointError, createApplicationHost } from './application-endpoint'
+import { ApplicationEndpointError, type HistoryPage, createApplicationHost } from './application-endpoint'
 
 /** Main-only adapter. Routing metadata and peer payloads never select a storage path. */
 export async function attachLocalServerApplication(options: {
@@ -47,6 +47,33 @@ export async function attachLocalServerApplication(options: {
         throw new ApplicationEndpointError('APPLICATION_NOT_AUTHORIZED')
       }
       return { displayName: current.displayName, channels: [] }
+    },
+    readServerHistory: async (context, query, signal) => {
+      signal.throwIfAborted()
+      const current = await storage.loadLocalServer(localStorageId)
+      signal.throwIfAborted()
+      if (current.serverId !== context.serverId) {
+        throw new ApplicationEndpointError('APPLICATION_NOT_AUTHORIZED')
+      }
+      const messages = await storage.listLocalServerMessages(localStorageId, {
+        channelId: query.channelId,
+        afterSequence: query.afterSequence,
+        limit: query.limit
+      })
+      signal.throwIfAborted()
+      const hasMore = messages.length === query.limit && messages.length > 0
+      return {
+        messages: messages.map((message) => ({
+          sequence: message.sequence,
+          messageId: message.messageId,
+          authorFingerprint: message.authorFingerprint,
+          content: message.content,
+          createdAt: message.createdAt,
+          editedAt: message.editedAt,
+          deletedAt: message.deletedAt
+        })),
+        hasMore
+      } satisfies HistoryPage
     }
   })
 }
