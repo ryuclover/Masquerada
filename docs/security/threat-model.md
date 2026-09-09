@@ -357,19 +357,31 @@ Network interface data é observação local do sistema operacional, não identi
 
 A decisão é baseada exclusivamente em classes e códigos estáveis, nunca em texto de `message`, `name` frouxo ou regex. Depois que `authorizationStarted` se torna verdadeiro, nenhuma classe permite outro path.
 
+O adaptador direct valida a identidade local antes de abrir transporte e so converte erros remotos/reachability explicitamente conhecidos em tentativa recuperavel. Falhas locais, de recursos e desconhecidas permanecem terminais, inclusive quando concorrem com abort.
+
 ### Resource, generation, deadline e shutdown
 
 O `ConnectivityResourceGovernor` limita oito connection operations globais, uma por Server Identity target, dezesseis secure attempts, oito operações UDP, 32 relay circuits, 1 MiB de relay bytes enfileirados e 32 rendezvous requests. Reservas runtime-branded usam release idempotente em `finally`; resource exhaustion não tenta protocolo alternativo.
 
+Cada conexao TCP limita a entrada pendente a 256 frames e 1 MiB, incluindo cabecalhos e o frame em processamento. Excesso encerra a conexao; dados parciais, replay e mensagens rejeitadas nao renovam o idle timeout. Atividade autorizada concluida renova idle sem alterar deadlines pre-auth. Cleanup zera os buffers de chaves derivados controlados pelo codigo e libera referencias de setup; nao garante zeroizacao das copias internas do runtime/OpenSSL.
+
+Requests HTTP UPnP possuem deadline absoluto, independente da chegada de bytes. Sucesso, rejeicao, aborto remoto e timeout cancelam o timer e encerram request/response, sem drenar indefinidamente corpos rejeitados.
+
+O banco de autoridade mantem quota de 1 MiB com `max_page_count` calculado pelo tamanho de pagina em cada abertura. Escritas sem capacidade falham sem impedir o carregamento do estado anterior; admissao reverte consumo, membro e certificado juntos. Migracao v3 para v4 somente confirma apos validacao completa. A allowlist de schema exclui apenas o prefixo literal `sqlite_`, rejeitando triggers e demais objetos inesperados.
+
 `NetworkEnvironmentTracker` produz snapshot canônico, deduplicado e order-independent de interfaces/endereços somente quando chamado explicitamente. STUN e LAN provenance carregam sua generation e deixam de influenciar aggregation depois de mudança; descriptors WAN assinados e ainda frescos não são invalidados pela mudança local. Não existe watcher nem recovery loop automático.
 
 Connection operations usam deadline monotônico absoluto. Child direct races, rendezvous queries e relay opens recebem `min(configuração, remainingOverallTime)`; remaining zero não inicia I/O. Signed timestamps continuam usando wall clock onde o protocolo exige. Relay registration/circuit durations e managed refresh usam relógio monotônico em produção.
+
+O deadline e revalidado ao iniciar cada tentativa, aceitar um vencedor e antes/depois da autorizacao, sem depender apenas da execucao do callback do timer. Handshakes internos via relay tambem reservam `SECURE_CONNECTION_ATTEMPT` no governor da subsystem e liberam a reserva em toda saida terminal.
 
 `ConnectivitySubsystem.shutdown()` muda primeiro para `SHUTTING_DOWN`, bloqueia novas operações, aborta scopes em voo e encerra resources registrados. O deadline máximo é cinco segundos; depois dele `forceClose` é best effort. Chamadas repetidas retornam a mesma promise, timers de renew/refresh são cancelados e nenhum estado pode reativar após `SHUT_DOWN`. A ordem de shutdown da aplicação deve ser rede primeiro e storage/identidades depois.
 
 Restart cria governors, generations, caches, observations, mappings, listeners, relay registrations/circuits e sessions vazios. Nenhum handle de topologia ou sessão é persistido ou restaurado; somente identidade, bindings, memberships, certificados e invite state intencionalmente persistentes no schema v4 sobrevivem.
 
 ## Riscos residuais conhecidos
+
+- O Application Protocol v1 (ETAPA 8.1) usa o namespace 0x70 sobre o AuthorizedPeerChannel: envelope com IDs hex de 128 bits, JSON canônico, schemas fechados, limites de corpo 40 KiB/payload 32 KiB, profundidade 8 e 2048 nós. Decode exige recodificação canônica byte a byte; duplicata de ID, replay, sequence fora de ordem e frames acima do rate limit falham fechadas. A autorização de leitura de estado é revalidada no ponto de uso; nenhuma mensagem concede authority.
 
 - Um host offline torna seu servidor indisponível; a arquitetura não promete disponibilidade central.
 - P2P e signaling podem revelar metadados de rede mesmo quando o conteúdo estiver protegido.
@@ -380,7 +392,7 @@ Restart cria governors, generations, caches, observations, mappings, listeners, 
 - Nesta etapa o owner representa uma Device Identity, não uma pessoa ou conta. Perda do dispositivo poderá exigir recuperação, transferência, múltiplos dispositivos ou identidade humana em protocolos futuros; nenhuma dessas alternativas é inferida ou executada automaticamente agora.
 - O banco `server.db` persiste o estado de domínio do servidor, mas não é raiz de confiança para identidade ou ownership criptográfico. Processos locais concorrentes executando no mesmo perfil de usuário poderiam teoricamente modificar o arquivo no disco entre verificações (TOCTOU local); mitigado no aplicativo pelo lock de instância única e validação no carregamento.
 - Convites funcionam como bearer capabilities: quem tiver posse do token assinado pode tentar admissão. A expiração depende do relógio local (sem autoridade central de tempo). A operação atômica de admissão garante que consumo do convite e inserção do novo membro ocorram indivisivelmente.
-- O transporte TCP foi introduzido em loopback seguro com streaming e mitigação de recursos (timeouts, limits, backpressure), mas a exposição em interfaces LAN/WAN e discovery público ainda dependem de etapas posteriores.
+- O transporte TCP oferece caminhos LAN/WAN e relay com ativacao explicita; o startup atual nao inicia listeners P2P. Reachability depende da interface, do firewall, do roteador e dos peers disponiveis, sem garantia de descoberta publica universal.
 - A validação de symlinks reduz escritas fora do diretório, mas não elimina ataques locais de troca entre verificação e uso por um processo concorrente com acesso ao mesmo perfil.
 - Uma interrupção abrupta durante a criação de servidor pode deixar diretórios temporários ou finais incompletos. Eles não são reconhecidos como servidores válidos sem um `server.json` completo e validado; limpeza de resíduos após crash fica para uma etapa futura.
 - Relays P2P ampliam riscos de privacidade, abuso e exaustão; os limites globais e locais, o payload interno opaco e a ausência de destinos arbitrários reduzem esses riscos, mas não ocultam do relay metadados de circuito, volume e timing.

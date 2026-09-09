@@ -25,13 +25,15 @@ import {
   RENDEZVOUS_REQUEST_BYTES,
   RendezvousDescriptorStore
 } from './peer-rendezvous'
-import type { SecureConnectionAttempt } from './candidate-racing'
+import { CandidateRaceError, type SecureConnectionAttempt } from './candidate-racing'
 import { encodeSessionFrame } from './p2p-session'
+import { ProtocolError } from './protocol-frame'
 import {
   ClientTcpPeerConnection,
   connectAndAdmitTcpPeer,
   establishSecureServerConnection,
   startTcpServer,
+  TcpTransportError,
   type ServerTcpPeerConnection,
   type TcpServerHandle
 } from './tcp-transport'
@@ -261,6 +263,13 @@ describe('peer-provided rendezvous over real authorized channels', () => {
         devicePublicKey: options.device.publicKey,
         devicePrivateKey: options.device.privateKey,
         signal: options.signal
+      }).catch((error: unknown) => {
+        if (error instanceof TcpTransportError || error instanceof ProtocolError) {
+          throw new CandidateRaceError(options.signal.aborted
+            ? 'CANDIDATE_RACE_ABORTED'
+            : 'CANDIDATE_SECURE_HANDSHAKE_FAILED')
+        }
+        throw error
       })
     }
 

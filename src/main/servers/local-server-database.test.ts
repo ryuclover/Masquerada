@@ -6,6 +6,7 @@ import {
   readFile,
   readdir,
   rm,
+  stat,
   symlink,
   unlink,
   writeFile
@@ -154,6 +155,39 @@ describe('persistência SQLite e membership integrada ao servidor local', () => 
     )
   })
 
+  it('carrega SQLite que cresceu validamente apos rejeitar escrita acima da capacidade', async () => {
+    const fixture = await createFixture()
+    const initialSize = (await stat(fixture.paths.database)).size
+    const db = openServerDatabase(fixture.paths.database)
+    try {
+      db.exec(`
+        WITH RECURSIVE ids(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM ids WHERE n < 4000)
+        INSERT INTO invites
+        SELECT printf('%032x', n), zeroblob(32), 2000000000, 3, 0, 0 FROM ids;
+      `)
+      db.exec('BEGIN IMMEDIATE; UPDATE invites SET uses = 1;')
+      expect(() => db.exec(`
+        WITH RECURSIVE ids(n) AS (SELECT 4001 UNION ALL SELECT n + 1 FROM ids WHERE n < 20000)
+        INSERT INTO invites
+        SELECT printf('%032x', n), zeroblob(32), 2000000000, 3, 0, 0 FROM ids;
+      `)).toThrowError(expect.objectContaining({ errcode: 13 }))
+      // Direct SQL callers must roll back if SQLite only reverted the failed statement.
+      try { db.exec('ROLLBACK;') } catch { /* SQLite may already have rolled back. */ }
+      expect(db.prepare('SELECT COUNT(*) AS count, SUM(uses) AS uses FROM invites;').get()).toMatchObject({
+        count: 4000, uses: 0
+      })
+    } finally {
+      db.close()
+    }
+    const size = (await stat(fixture.paths.database)).size
+    expect(size).toBeGreaterThan(initialSize)
+    expect(size).toBeLessThanOrEqual(MAX_INITIAL_SERVER_DATABASE_BYTES)
+    await expect(fixture.storage.loadLocalServer(FIRST_ID)).resolves.toMatchObject({
+      localStorageId: FIRST_ID,
+      serverId: fixture.server.serverId
+    })
+  })
+
   it('rejeita carregamento se server.db tiver user_version incompatível', async () => {
     const fixture = await createFixture()
     const db = new DatabaseSync(fixture.paths.database)
@@ -197,6 +231,17 @@ describe('persistência SQLite e membership integrada ao servidor local', () => 
       storageB.loadLocalServer(FIRST_ID),
       'SERVER_MEMBERSHIP_STATE_INVALID'
     )
+  })
+
+  it('rejeita trigger sqlitex_ que tentava se ocultar entre objetos internos SQLite', async () => {
+    const fixture = await createFixture()
+    const db = new DatabaseSync(fixture.paths.database)
+    db.exec('CREATE TRIGGER sqlitex_hidden AFTER UPDATE ON invites BEGIN DELETE FROM members; END;')
+    db.close()
+    const before = await readFile(fixture.paths.database)
+
+    await expectStorageError(fixture.storage.loadLocalServer(FIRST_ID), 'SERVER_DATABASE_SCHEMA_INVALID')
+    expect(await readFile(fixture.paths.database)).toEqual(before)
   })
 
   it('não recria nem auto-repara server.db quando o owner é removido de members', async () => {

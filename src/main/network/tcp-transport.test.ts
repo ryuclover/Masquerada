@@ -1,10 +1,10 @@
 import { createHash, createPrivateKey, generateKeyPairSync, type KeyObject } from 'node:crypto'
 import { mkdtemp, rm } from 'node:fs/promises'
-import { createConnection } from 'node:net'
+import { createConnection, type Socket } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import {
   createAuthenticatedCandidateDevice
@@ -19,17 +19,21 @@ import {
   ClientHandshake
 } from './p2p-handshake'
 import {
-  ClientSessionSetup
+  ClientSessionSetup,
+  encodeSessionFrame
 } from './p2p-session'
 import {
   connectAndAdmitTcpPeer,
   DEFAULT_LOOPBACK_HOST,
+  MAX_PENDING_READ_BYTES,
+  MAX_PENDING_READ_FRAMES,
   ServerTcpPeerConnection,
   startTcpServer,
   type TcpServerHandle
 } from './tcp-transport'
 import {
   encodeProtocolFrame,
+  HEADER_LENGTH,
   ProtocolFrameDecoder,
   ProtocolFrameType
 } from './protocol-frame'
@@ -40,6 +44,150 @@ const activeServers: TcpServerHandle[] = []
 afterEach(async () => {
   await Promise.all(activeServers.splice(0).map((srv) => srv.close()))
   await Promise.all(testRoots.splice(0).map((root) => rm(root, { force: true, recursive: true })))
+})
+
+describe('hardening de filas e atividade autorizada', () => {
+  it.each(['client', 'server'] as const)('%s: libera contadores apos processamento e rejeita replay sem renovar idle', async (side) => {
+    const { client, server } = await createAuthorizedPair()
+    const receiver = side === 'client' ? client : server
+    const sender = side === 'client' ? server : client
+    const internals = receiver as unknown as {
+      socket: Socket
+      currentTimer: NodeJS.Timeout
+      pendingReadFrames: number
+      pendingReadBytes: number
+    }
+    const messages: string[] = []
+    receiver.getAuthorizedChannel()!.setMessageHandler((plaintext) => {
+      messages.push(plaintext.toString())
+    })
+    try {
+      await vi.waitFor(() => expect(internals.pendingReadFrames).toBe(0))
+      const refresh = vi.spyOn(internals.currentTimer, 'refresh')
+      const frames = Array.from({ length: 10 }, (_, i) =>
+        encodeSessionFrame(sender.getSession()!.encrypt(Buffer.from(`ordered-${i}`))))
+      internals.socket.emit('data', Buffer.concat(frames))
+      await vi.waitFor(() => expect(internals.pendingReadFrames).toBe(0))
+      expect(messages).toEqual(Array.from({ length: 10 }, (_, i) => `ordered-${i}`))
+      expect(internals.pendingReadBytes).toBe(0)
+      expect(refresh).toHaveBeenCalledTimes(10)
+      internals.socket.emit('data', frames[0]!)
+      await vi.waitFor(() => expect(receiver.getState()).not.toBe('MEMBER_CONNECTED'))
+      expect(refresh).toHaveBeenCalledTimes(10)
+      expect(messages).toHaveLength(10)
+    } finally {
+      client.destroy()
+      server.destroy()
+    }
+  })
+
+  for (const side of ['server', 'client'] as const) {
+    for (const limit of ['frames', 'bytes'] as const) {
+      it(`${side}: encerra inundacao por ${limit} com consumidor bloqueado e limpa recursos`, async () => {
+        const { client, server } = await createAuthorizedPair()
+        const receiver = side === 'server' ? server : client
+        const sender = side === 'server' ? client : server
+        const internals = receiver as unknown as {
+          socket: Socket
+          frameQueue: unknown[]
+          pendingReadFrames: number
+          pendingReadBytes: number
+          isProcessingFrames: boolean
+          decoder: ProtocolFrameDecoder | null
+          currentTimer: NodeJS.Timeout | null
+        }
+        let release!: () => void
+        const blocked = new Promise<void>((resolve) => { release = resolve })
+        const handler = vi.fn(() => blocked)
+        const channel = receiver.getAuthorizedChannel()!
+        channel.setMessageHandler(handler)
+        channel.onClose(() => { throw new Error('Consumer cleanup failed') })
+        const closed = vi.fn()
+        channel.onClose(closed)
+        const session = receiver.getSession()!
+        const plaintext = Buffer.alloc(limit === 'frames' ? 0 : 65536 - HEADER_LENGTH - 25)
+        const makeFrame = () => encodeSessionFrame(sender.getSession()!.encrypt(plaintext))
+        const frameBytes = HEADER_LENGTH + plaintext.length + 25
+        const capacity = limit === 'frames' ? MAX_PENDING_READ_FRAMES : MAX_PENDING_READ_BYTES / frameBytes
+        try {
+          await vi.waitFor(() => expect(internals.pendingReadFrames).toBe(0))
+          internals.socket.emit('data', makeFrame())
+          expect(handler).toHaveBeenCalledTimes(1)
+          for (let i = 1; i < capacity; i++) internals.socket.emit('data', makeFrame())
+          expect(receiver.getState()).toBe('MEMBER_CONNECTED')
+          expect(internals.pendingReadFrames).toBe(capacity)
+          expect(internals.pendingReadBytes).toBe(capacity * frameBytes)
+          expect(internals.frameQueue).toHaveLength(capacity - 1)
+
+          internals.socket.emit('data', makeFrame())
+          expect(receiver.getState()).toBe(side === 'server' ? 'CLOSED' : 'FAILED')
+          expect(internals.socket.destroyed).toBe(true)
+          expect(internals.frameQueue).toHaveLength(0)
+          expect(internals.pendingReadFrames).toBe(0)
+          expect(internals.pendingReadBytes).toBe(0)
+          expect(internals.decoder).toBeNull()
+          expect(internals.currentTimer).toBeNull()
+          expect(receiver.getEstablishedContext()).toBeNull()
+          expect(session.isDestroyed()).toBe(true)
+          expect(closed).toHaveBeenCalledTimes(1)
+          release()
+          await vi.waitFor(() => expect(internals.isProcessingFrames).toBe(false))
+          expect(handler).toHaveBeenCalledTimes(1)
+          expect(internals.pendingReadBytes).toBe(0)
+          expect(internals.currentTimer).toBeNull()
+        } finally {
+          release()
+          client.destroy()
+          server.destroy()
+        }
+      })
+    }
+  }
+
+  it.each(['client', 'server'] as const)('renova envio de %s e recebimento remoto, mas encerra apos inatividade', async (side) => {
+    const { client, server } = await createAuthorizedPair(500)
+    const sender = side === 'client' ? client : server
+    const receiver = side === 'client' ? server : client
+    const messages: string[] = []
+    receiver.getAuthorizedChannel()!.setMessageHandler((plaintext) => {
+      messages.push(plaintext.toString())
+    })
+    try {
+      for (let i = 0; i < 5; i++) {
+        await new Promise((resolve) => setTimeout(resolve, 150))
+        await sender.getAuthorizedChannel()!.send(Buffer.from(`message-${i}`))
+        await vi.waitFor(() => expect(messages).toHaveLength(i + 1))
+      }
+      expect(client.getState()).toBe('MEMBER_CONNECTED')
+      expect(server.getState()).toBe('MEMBER_CONNECTED')
+      await vi.waitFor(() => {
+        expect(client.getState()).not.toBe('MEMBER_CONNECTED')
+        expect(server.getState()).not.toBe('MEMBER_CONNECTED')
+      }, { timeout: 1500 })
+    } finally {
+      client.destroy()
+      server.destroy()
+    }
+  })
+
+  it.each(['client', 'server'] as const)('%s: bytes parciais nao renovam idle autenticado', async (side) => {
+    const { client, server } = await createAuthorizedPair(500)
+    const receiver = side === 'client' ? client : server
+    const { socket, currentTimer } = receiver as unknown as { socket: Socket; currentTimer: NodeJS.Timeout }
+    const refresh = vi.spyOn(currentTimer, 'refresh')
+    try {
+      // Refresh neither endpoint through raw bytes, even in MEMBER_CONNECTED.
+      for (let i = 0; i < 3; i++) {
+        await new Promise((resolve) => setTimeout(resolve, 100))
+        socket.emit('data', Buffer.from([0x4d, 0x51, 0x52]).subarray(i, i + 1))
+      }
+      expect(refresh).not.toHaveBeenCalled()
+      await vi.waitFor(() => expect(receiver.getState()).not.toBe('MEMBER_CONNECTED'), { timeout: 1000 })
+    } finally {
+      client.destroy()
+      server.destroy()
+    }
+  })
 })
 
 describe('transporte TCP P2P seguro e streaming de frames', () => {
@@ -1281,6 +1429,38 @@ describe('transporte TCP P2P seguro e streaming de frames', () => {
     })
   })
 })
+
+async function createAuthorizedPair(idleTimeoutMs = 30000) {
+  const fixture = await createLocalServerFixture()
+  const device = createClientFixture()
+  const { encoded: invite } = await fixture.storage.createLocalServerInvite(fixture.storageId, {
+    expiresAt: 2000000000,
+    maxUses: 1
+  })
+  let server!: ServerTcpPeerConnection
+  const handle = await startTcpServer({
+    storage: fixture.storage,
+    localStorageId: fixture.storageId,
+    serverId: fixture.serverId,
+    serverPublicKey: fixture.publicKey,
+    serverPrivateKey: fixture.privateKey,
+    idleTimeoutMs,
+    onMemberConnected: (connection) => { server = connection }
+  })
+  activeServers.push(handle)
+  const client = connectAndAdmitTcpPeer({
+    host: handle.host,
+    port: handle.port,
+    expectedServerId: fixture.serverId,
+    deviceFingerprint: device.fingerprint,
+    devicePublicKey: device.publicKey,
+    devicePrivateKey: device.privateKey,
+    invite,
+    idleTimeoutMs
+  })
+  await client.waitForAdmission()
+  return { client, server }
+}
 
 function getServerMembers(serverFixture: { userDataDir: string; storageId: string }) {
   const dbPath = join(serverFixture.userDataDir, 'servers', serverFixture.storageId, DATABASE_FILE_NAME)

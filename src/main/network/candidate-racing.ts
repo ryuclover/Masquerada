@@ -1,4 +1,9 @@
-import type { KeyObject } from 'node:crypto'
+import { createPublicKey, type KeyObject } from 'node:crypto'
+
+import { createDeviceAuthChallengeSigner, DeviceAuthError } from '../security/device-auth'
+import { ClientHandshake, HandshakeError } from './p2p-handshake'
+import { SessionError } from './p2p-session'
+import { ProtocolError } from './protocol-frame'
 
 import {
   EphemeralCandidateSuccessCache,
@@ -9,6 +14,7 @@ import {
 import {
   establishSecureServerConnection,
   isClientSecurePreAuthorizationConnection,
+  TcpTransportError,
   type ClientSecurePreAuthorizationConnection,
   type ClientTcpPeerConnection
 } from './tcp-transport'
@@ -85,17 +91,68 @@ function validateTiming(attemptDelayMs: number, overallTimeoutMs: number): void 
 }
 
 const defaultEstablish: SecureConnectionAttempt = async (target, options) => {
+  const connectionOptions = {
+    endpoint: target,
+    expectedServerId: options.expectedServerId,
+    expectedServerPublicKey: options.expectedServerPublicKey,
+    deviceFingerprint: options.device.fingerprint,
+    devicePublicKey: Buffer.from(options.device.publicKey),
+    devicePrivateKey: options.device.privateKey,
+    signal: options.signal
+  }
+  // HANDSHAKE_KEY_INVALID also describes local identity failures. Validate outside
+  // the remote-error boundary, including the private/public key binding.
+  new ClientHandshake(connectionOptions)
+  createDeviceAuthChallengeSigner(connectionOptions.devicePrivateKey)
+  if (!createPublicKey(connectionOptions.devicePrivateKey)
+    .export({ format: 'der', type: 'spki' }).equals(connectionOptions.devicePublicKey)) {
+    throw new DeviceAuthError('DEVICE_AUTH_INVALID_PRIVATE_KEY')
+  }
+
   try {
-    return await establishSecureServerConnection({
-      endpoint: target,
-      expectedServerId: options.expectedServerId,
-      expectedServerPublicKey: options.expectedServerPublicKey,
-      deviceFingerprint: options.device.fingerprint,
-      devicePublicKey: options.device.publicKey,
-      devicePrivateKey: options.device.privateKey,
-      signal: options.signal
-    })
-  } catch {
+    return await establishSecureServerConnection(connectionOptions)
+  } catch (error) {
+    const remoteFailure =
+      (error instanceof HandshakeError && [
+        'HANDSHAKE_VERSION_UNSUPPORTED',
+        'HANDSHAKE_MESSAGE_TYPE_UNSUPPORTED',
+        'HANDSHAKE_MESSAGE_INVALID',
+        'HANDSHAKE_SERVER_ID_MISMATCH',
+        'HANDSHAKE_SERVER_PROOF_INVALID',
+        'HANDSHAKE_SERVER_FINISH_INVALID',
+        'HANDSHAKE_KEY_INVALID'
+      ].includes(error.code)) ||
+      (error instanceof ProtocolError && [
+        'PROTOCOL_INVALID_MAGIC',
+        'PROTOCOL_VERSION_UNSUPPORTED',
+        'PROTOCOL_FRAME_TYPE_UNSUPPORTED',
+        'PROTOCOL_FLAGS_UNSUPPORTED',
+        'PROTOCOL_FRAME_TOO_LARGE',
+        'PROTOCOL_FRAME_TRUNCATED',
+        'PROTOCOL_FRAME_INVALID'
+      ].includes(error.code)) ||
+      (error instanceof SessionError && [
+        'SESSION_KEY_SHARE_INVALID',
+        'SESSION_SIGNATURE_INVALID',
+        'SESSION_MESSAGE_INVALID',
+        'SESSION_MESSAGE_TYPE_UNSUPPORTED',
+        'SESSION_VERSION_UNSUPPORTED',
+        'SESSION_CONFIRMATION_INVALID'
+      ].includes(error.code)) ||
+      (error instanceof TcpTransportError && [
+        'TCP_TIMEOUT',
+        'TCP_CONNECT_TIMEOUT',
+        'TCP_WRONG_FRAME_TYPE',
+        'TCP_CONNECTION_CLOSED'
+      ].includes(error.code)) ||
+      (error instanceof Error &&
+        ['connect', 'read', 'write'].includes((error as NodeJS.ErrnoException).syscall ?? '') &&
+        ['ECONNREFUSED', 'ECONNRESET', 'ECONNABORTED', 'ETIMEDOUT', 'EHOSTUNREACH', 'ENETUNREACH', 'EPIPE']
+          .includes((error as NodeJS.ErrnoException).code ?? ''))
+
+    // Generic crypto/state failures, resource exhaustion and unknown errors are
+    // terminal, even when cancellation races with their rejection.
+    if (!remoteFailure) throw error
     throw new CandidateRaceError(options.signal.aborted
       ? 'CANDIDATE_RACE_ABORTED'
       : 'CANDIDATE_SECURE_HANDSHAKE_FAILED')
@@ -137,6 +194,12 @@ export function raceSecureServerConnections(
   const resourceGovernor = options.resourceGovernor ?? defaultConnectivityResourceGovernor
 
   return new Promise<SecureRaceWinner>((resolve, reject) => {
+    const deadline = readMonotonicMs() + overallTimeoutMs
+    const readActiveMonotonicMs = (): number => {
+      const current = readMonotonicMs()
+      if (current >= deadline) throw new CandidateRaceError('CANDIDATE_RACE_TIMEOUT')
+      return current
+    }
     let settled = false
     let nextIndex = 0
     let active = 0
@@ -179,7 +242,7 @@ export function raceSecureServerConnections(
       if (settled || nextIndex >= targets.length || active >= MAX_CONCURRENT_CANDIDATE_ATTEMPTS) return
       clearStagger()
       let current: number
-      try { current = readMonotonicMs() } catch { fail(new CandidateRaceError('CANDIDATE_PLAN_INVALID')); return }
+      try { current = readActiveMonotonicMs() } catch (cause) { fail(cause); return }
       const elapsed = current - lastStartMs
       const desiredGap = fastFailure ? MIN_CANDIDATE_ATTEMPT_GAP_MS : attemptDelayMs
       const delay = Math.max(0, desiredGap - Math.max(0, elapsed))
@@ -217,7 +280,7 @@ export function raceSecureServerConnections(
       }
 
       let startedAt: number
-      try { startedAt = readMonotonicMs() } catch { fail(new CandidateRaceError('CANDIDATE_PLAN_INVALID')); return }
+      try { startedAt = readActiveMonotonicMs() } catch (cause) { fail(cause); return }
       const controller = new AbortController()
       let attemptReservation
       try {
@@ -233,6 +296,7 @@ export function raceSecureServerConnections(
 
       void Promise.resolve().then(async () => {
         if (controller.signal.aborted) throw new CandidateRaceError('CANDIDATE_RACE_ABORTED')
+        readActiveMonotonicMs()
         return establish(target!, {
           expectedServerId: options.plan.expectedServerId,
           expectedServerPublicKey: expectedPublicKey,
@@ -258,9 +322,8 @@ export function raceSecureServerConnections(
           return
         }
         let completedAt: number
-        try { completedAt = readMonotonicMs() } catch {
-          connection.destroy()
-          fail(new CandidateRaceError('CANDIDATE_PLAN_INVALID'))
+        try { completedAt = readActiveMonotonicMs() } catch (cause) {
+          fail(cause)
           return
         }
         options.successCache?.recordCryptographicSuccess(
@@ -278,7 +341,8 @@ export function raceSecureServerConnections(
           cause instanceof CandidateRaceError &&
           (cause.code === 'CANDIDATE_SECURE_HANDSHAKE_FAILED' || cause.code === 'CANDIDATE_RACE_ABORTED')
         ) attemptFinished()
-        else if (cause instanceof ConnectivityResourceError) fail(cause)
+        else if (cause instanceof ConnectivityResourceError ||
+          (cause instanceof CandidateRaceError && cause.code === 'CANDIDATE_RACE_TIMEOUT')) fail(cause)
         else fail(new CandidateRaceError('CANDIDATE_PLAN_INVALID'))
       }).finally(() => attemptReservation.release())
     }

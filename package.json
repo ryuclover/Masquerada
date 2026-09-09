@@ -5,6 +5,7 @@
   "description": "Aplicativo desktop local-first de comunicação P2P.",
   "main": "./out/main/index.js",
   "scripts": {
+    "electron:install": "install-electron",
     "dev": "electron-vite dev",
     "build": "npm run typecheck && electron-vite build",
     "lint": "eslint . --max-warnings 0",

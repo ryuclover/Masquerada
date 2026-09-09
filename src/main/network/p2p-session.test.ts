@@ -27,11 +27,72 @@ import {
   SecureSession,
   ServerSessionSetup,
   SESSION_SETUP_VERSION,
+  type DerivedSessionKeys,
   type SessionErrorCode
 } from './p2p-session'
 import { ProtocolFrameType } from './protocol-frame'
 
 describe('acordo de chaves efêmero e sessão segura P2P em memória', () => {
+  it.each(['established', 'destroyed', 'invalid-confirm'] as const)(
+    'limpa chaves derivadas de ambos os setups: %s', (outcome) => {
+      const { clientContext, serverContext } = createEstablishedHandshakePair()
+      const client = new ClientSessionSetup(clientContext)
+      const server = new ServerSessionSetup(serverContext)
+      const serverShare = server.processClientKeyShare(client.createClientKeyShare())
+      const clientConfirm = client.processServerKeyShare(serverShare)
+      const clientInternals = client as unknown as {
+        derivedKeys?: DerivedSessionKeys
+        clientEphemeralKeyPair?: unknown
+        session?: SecureSession
+      }
+      const serverInternals = server as unknown as {
+        derivedKeys?: DerivedSessionKeys
+        serverEphemeralKeyPair?: unknown
+        session?: SecureSession
+      }
+      const keys = [clientInternals.derivedKeys!, serverInternals.derivedKeys!]
+      expect(clientInternals.clientEphemeralKeyPair).toBeUndefined()
+      expect(serverInternals.serverEphemeralKeyPair).toBeUndefined()
+      if (outcome === 'established') {
+        const { serverKeyConfirm, session: serverSession } = server.processClientKeyConfirm(clientConfirm)
+        const clientSession = client.processServerKeyConfirm(serverKeyConfirm)
+        expect(clientInternals.derivedKeys).toBeUndefined()
+        expect(serverInternals.derivedKeys).toBeUndefined()
+        for (const derived of keys) {
+          expect(derived.clientToServerKey.equals(Buffer.alloc(32))).toBe(true)
+          expect(derived.serverToClientKey.equals(Buffer.alloc(32))).toBe(true)
+        }
+        client.destroy()
+        server.destroy()
+        const message = Buffer.from('session owns independent keys')
+        expect(serverSession.decrypt(clientSession.encrypt(message))).toEqual(message)
+        expect(clientSession.decrypt(serverSession.encrypt(message))).toEqual(message)
+        clientSession.destroy()
+        serverSession.destroy()
+      } else if (outcome === 'invalid-confirm') {
+        expect(() => client.processServerKeyConfirm(Buffer.alloc(0))).toThrow()
+        expect(() => server.processClientKeyConfirm(Buffer.alloc(0))).toThrow()
+      } else {
+        client.destroy()
+        server.destroy()
+        client.destroy()
+        server.destroy()
+        expect(() => client.processServerKeyConfirm(Buffer.alloc(0))).toThrow()
+        expect(() => server.processClientKeyConfirm(clientConfirm)).toThrow()
+      }
+      for (const derived of keys) {
+        for (const key of [derived.clientToServerKey, derived.serverToClientKey,
+          derived.clientToServerNoncePrefix, derived.serverToClientNoncePrefix]) {
+          expect(key.equals(Buffer.alloc(key.length))).toBe(true)
+        }
+      }
+      expect(clientInternals.derivedKeys).toBeUndefined()
+      expect(serverInternals.derivedKeys).toBeUndefined()
+      expect(clientInternals.session).toBeUndefined()
+      expect(serverInternals.session).toBeUndefined()
+    }
+  )
+
   describe('estabelecimento completo de sessão e confirmação mútua', () => {
     it('estabelece SecureSession bidirecional autenticada e confidencial', () => {
       const { clientContext, serverContext } = createEstablishedHandshakePair()

@@ -119,9 +119,16 @@ async function boundedHttpRequest(options: {
 }): Promise<UpnpHttpResponse> {
   return new Promise<UpnpHttpResponse>((resolve, reject) => {
     let settled = false
+    let activeResponse: IncomingMessage | undefined
+    const chunks: Buffer[] = []
     const finish = (callback: () => void): void => {
       if (settled) return
       settled = true
+      clearTimeout(timer)
+      chunks.length = 0
+      // Keep error handlers installed to absorb errors queued by destruction.
+      activeResponse?.destroy()
+      request.destroy()
       callback()
     }
     const request = httpRequest({
@@ -139,15 +146,20 @@ async function boundedHttpRequest(options: {
         ...options.headers
       }
     }, (response) => {
+      response.on('error', () => finish(() => reject(new UpnpError('UPNP_HTTP_RESPONSE_INVALID'))))
+      if (settled) {
+        response.destroy()
+        return
+      }
+      activeResponse = response
+      response.on('aborted', () => finish(() => reject(new UpnpError('UPNP_HTTP_RESPONSE_INVALID'))))
       const status = response.statusCode ?? 0
       if (status >= 300 && status < 400) {
-        response.resume()
         finish(() => reject(new UpnpError('UPNP_HTTP_REDIRECT_PROHIBITED')))
         return
       }
       const validStatus = status === 200 || (options.allowSoapFaultStatus === true && status === 500)
       if (!validStatus) {
-        response.resume()
         finish(() => reject(new UpnpError('UPNP_HTTP_RESPONSE_INVALID')))
         return
       }
@@ -155,52 +167,54 @@ async function boundedHttpRequest(options: {
         countRawHeader(response, 'content-length') > 1 ||
         countRawHeader(response, 'content-encoding') > 1
       ) {
-        response.resume()
         finish(() => reject(new UpnpError('UPNP_HTTP_RESPONSE_INVALID')))
         return
       }
       const encoding = response.headers['content-encoding']
       if (encoding !== undefined && String(encoding).trim().toLowerCase() !== 'identity') {
-        response.resume()
         finish(() => reject(new UpnpError('UPNP_HTTP_RESPONSE_INVALID')))
         return
       }
       const contentLength = response.headers['content-length']
       if (contentLength !== undefined) {
         if (!/^\d+$/.test(String(contentLength))) {
-          response.resume()
           finish(() => reject(new UpnpError('UPNP_HTTP_RESPONSE_INVALID')))
           return
         }
         const declared = Number(contentLength)
         if (!Number.isSafeInteger(declared) || declared > options.maxBodyBytes) {
-          response.resume()
           finish(() => reject(new UpnpError('UPNP_HTTP_RESPONSE_TOO_LARGE')))
           return
         }
       }
-      const chunks: Buffer[] = []
       let total = 0
-      response.on('error', () => finish(() => reject(new UpnpError('UPNP_HTTP_RESPONSE_INVALID'))))
       response.on('data', (chunk: Buffer | string) => {
+        if (settled) return
         const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)
         total += buffer.length
         if (total > options.maxBodyBytes) {
-          response.destroy()
           finish(() => reject(new UpnpError('UPNP_HTTP_RESPONSE_TOO_LARGE')))
           return
         }
         chunks.push(buffer)
       })
-      response.on('end', () => finish(() => resolve({ statusCode: status, body: Buffer.concat(chunks) })))
+      response.on('end', () => {
+        if (settled) return
+        const body = Buffer.concat(chunks)
+        finish(() => resolve({ statusCode: status, body }))
+      })
     })
     request.on('error', () => finish(() => reject(new UpnpError('UPNP_HTTP_RESPONSE_INVALID'))))
-    request.setTimeout(options.timeoutMs ?? UPNP_HTTP_TIMEOUT_MS, () => {
-      request.destroy()
+    // One absolute deadline covers connection, headers and the entire body.
+    const timer = setTimeout(() => {
       finish(() => reject(new UpnpError('UPNP_HTTP_TIMEOUT')))
-    })
-    if (options.body) request.write(options.body)
-    request.end()
+    }, options.timeoutMs ?? UPNP_HTTP_TIMEOUT_MS)
+    try {
+      if (options.body) request.write(options.body)
+      request.end()
+    } catch (error) {
+      finish(() => reject(error))
+    }
   })
 }
 

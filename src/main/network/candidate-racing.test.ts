@@ -95,6 +95,57 @@ function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void; reje
 describe('bounded cryptographic candidate racing', () => {
   afterEach(() => vi.useRealTimers())
 
+  it('does not launch I/O when the deadline expires in the queued attempt microtask', async () => {
+    vi.useFakeTimers()
+    let now = 0
+    const establish = vi.fn()
+    const race = raceSecureServerConnections({
+      plan: makePlan(), device, overallTimeoutMs: 100,
+      monotonicNowMs: () => now, establishConnection: establish
+    })
+    now = 100
+    await expect(race).rejects.toMatchObject({ code: 'CANDIDATE_RACE_TIMEOUT' })
+    expect(establish).not.toHaveBeenCalled()
+  })
+
+  it('destroys an expired secure winner before the timeout timer runs and records no success', async () => {
+    vi.useFakeTimers()
+    let now = 0
+    const connection = secure()
+    const successCache = new EphemeralCandidateSuccessCache()
+    const record = vi.spyOn(successCache, 'recordCryptographicSuccess')
+    const establish = vi.fn(async () => { now = 100; return connection })
+    await expect(raceSecureServerConnections({
+      plan: makePlan([mapped('1.1.1.1', 1), mapped('8.8.8.8', 2)]), device,
+      overallTimeoutMs: 100, monotonicNowMs: () => now, successCache,
+      establishConnection: establish
+    })).rejects.toMatchObject({ code: 'CANDIDATE_RACE_TIMEOUT' })
+    expect(connection.isDestroyed()).toBe(true)
+    expect(record).not.toHaveBeenCalled()
+    expect(establish).toHaveBeenCalledTimes(1)
+  })
+
+  it('does not start a staggered candidate after the monotonic deadline', async () => {
+    vi.useFakeTimers()
+    let now = 0
+    const pending = deferred<ClientSecurePreAuthorizationConnection>()
+    const establish = vi.fn(() => pending.promise)
+    const race = raceSecureServerConnections({
+      plan: makePlan([mapped('1.1.1.1', 1), mapped('8.8.8.8', 2)]), device,
+      overallTimeoutMs: 1000, monotonicNowMs: () => now, establishConnection: establish
+    })
+    const expectation = expect(race).rejects.toMatchObject({ code: 'CANDIDATE_RACE_TIMEOUT' })
+    await vi.advanceTimersByTimeAsync(0)
+    now = 1000
+    await vi.advanceTimersByTimeAsync(CANDIDATE_ATTEMPT_DELAY_MS)
+    await expectation
+    expect(establish).toHaveBeenCalledTimes(1)
+    const connection = secure()
+    pending.resolve(connection)
+    await vi.advanceTimersByTimeAsync(0)
+    expect(connection.isDestroyed()).toBe(true)
+  })
+
   it('starts the first attempt immediately and staggers the second by 250 ms', async () => {
     vi.useFakeTimers()
     const starts: number[] = []

@@ -301,7 +301,6 @@ export class ClientSessionSetup {
   private serverEphemeralPublicKey?: Buffer
   private sharedSecret?: Buffer
   private derivedKeys?: DerivedSessionKeys
-  private session?: SecureSession
 
   constructor(context: EstablishedClientHandshakeContext) {
     if (!isEstablishedClientHandshakeContext(context)) {
@@ -416,6 +415,7 @@ export class ClientSessionSetup {
       // Limpa chave efêmera privada e shared secret brutos
       this.sharedSecret.fill(0)
       this.sharedSecret = undefined
+      this.clientEphemeralKeyPair = undefined
 
       // Gera CLIENT_KEY_CONFIRM usando sequence 0
       const confirmCipher = createCipheriv(
@@ -491,7 +491,7 @@ export class ClientSessionSetup {
         throw new SessionError('SESSION_CONFIRMATION_INVALID')
       }
 
-      this.session = new SecureSession({
+      const session = new SecureSession({
         role: 'client',
         sessionId: this.derivedKeys.sessionId,
         transcriptHash: this.context.transcriptHash,
@@ -504,7 +504,8 @@ export class ClientSessionSetup {
       })
 
       this.state = 'ESTABLISHED'
-      return this.session
+      this.clearKeyMaterial()
+      return session
     } catch (error) {
       this.fail()
       if (error instanceof SessionError) throw error
@@ -517,7 +518,18 @@ export class ClientSessionSetup {
   }
 
   private fail(): void {
+    this.destroy()
+  }
+
+  destroy(): void {
     this.state = 'FAILED'
+    this.clearKeyMaterial()
+  }
+
+  private clearKeyMaterial(): void {
+    this.clientEphemeralKeyPair = undefined
+    this.clientKeyShareBuffer = undefined
+    this.serverEphemeralPublicKey = undefined
     if (this.sharedSecret) {
       this.sharedSecret.fill(0)
       this.sharedSecret = undefined
@@ -527,6 +539,7 @@ export class ClientSessionSetup {
       this.derivedKeys.serverToClientKey.fill(0)
       this.derivedKeys.clientToServerNoncePrefix.fill(0)
       this.derivedKeys.serverToClientNoncePrefix.fill(0)
+      this.derivedKeys = undefined
     }
   }
 }
@@ -543,7 +556,6 @@ export class ServerSessionSetup {
   private serverEphemeralKeyPair?: { publicKey: Buffer; privateKey: KeyObject }
   private sharedSecret?: Buffer
   private derivedKeys?: DerivedSessionKeys
-  private session?: SecureSession
 
   constructor(context: EstablishedServerHandshakeContext) {
     if (!isEstablishedServerHandshakeContext(context)) {
@@ -634,6 +646,7 @@ export class ServerSessionSetup {
       // Limpa material secreto bruto
       this.sharedSecret.fill(0)
       this.sharedSecret = undefined
+      this.serverEphemeralKeyPair = undefined
 
       const serverKeyShare: ServerKeyShare = {
         sessionSetupVersion: SESSION_SETUP_VERSION,
@@ -719,7 +732,7 @@ export class ServerSessionSetup {
         }
       )
 
-      this.session = new SecureSession({
+      const session = new SecureSession({
         role: 'server',
         sessionId: this.derivedKeys.sessionId,
         transcriptHash: this.context.transcriptHash,
@@ -732,9 +745,10 @@ export class ServerSessionSetup {
       })
 
       this.state = 'ESTABLISHED'
+      this.clearKeyMaterial()
       return {
         serverKeyConfirm,
-        session: this.session
+        session
       }
     } catch (error) {
       this.fail()
@@ -748,7 +762,17 @@ export class ServerSessionSetup {
   }
 
   private fail(): void {
+    this.destroy()
+  }
+
+  destroy(): void {
     this.state = 'FAILED'
+    this.clearKeyMaterial()
+  }
+
+  private clearKeyMaterial(): void {
+    this.serverEphemeralKeyPair = undefined
+    this.clientEphemeralPublicKey = undefined
     if (this.sharedSecret) {
       this.sharedSecret.fill(0)
       this.sharedSecret = undefined
@@ -758,6 +782,7 @@ export class ServerSessionSetup {
       this.derivedKeys.serverToClientKey.fill(0)
       this.derivedKeys.clientToServerNoncePrefix.fill(0)
       this.derivedKeys.serverToClientNoncePrefix.fill(0)
+      this.derivedKeys = undefined
     }
   }
 }
@@ -1059,6 +1084,7 @@ export function deriveSessionKeys(options: {
   const serverToClientNoncePrefix = Buffer.from(
     derivedBuffer.subarray(offset, offset + NONCE_PREFIX_BYTES)
   )
+  derivedBuffer.fill(0)
 
   return {
     sessionId,
@@ -1170,7 +1196,7 @@ function computeX25519SharedSecret(
       privateKey,
       publicKey
     })
-    return Buffer.from(secret)
+    return secret
   } catch {
     throw new SessionError('SESSION_DIFFIE_HELLMAN_FAILED')
   }

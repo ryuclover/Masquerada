@@ -1,5 +1,5 @@
 import { createHash, generateKeyPairSync, type KeyObject } from 'node:crypto'
-import { describe, expect, it, vi } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import {
   connectToServer,
@@ -12,13 +12,13 @@ import {
   createSignedConnectivityDescriptor,
   verifySignedConnectivityDescriptor
 } from './connectivity-descriptor'
-import { createPeerRelayEndpoint, createPeerRelayService } from './peer-relay'
+import { createPeerRelayEndpoint, createPeerRelayService, type RelayTransportStream } from './peer-relay'
 import {
   createPeerRendezvousEndpoint,
   markRendezvousShareable,
   RendezvousDescriptorStore
 } from './peer-rendezvous'
-import { tcpTransportTestOnly } from './tcp-transport'
+import { tcpTransportTestOnly, type ClientSecurePreAuthorizationConnection } from './tcp-transport'
 import { ConnectivitySubsystem } from './connectivity-subsystem'
 import { CandidateRaceError } from './candidate-racing'
 import {
@@ -152,6 +152,232 @@ function rendezvousPath() {
 }
 
 describe('unified connectivity orchestrator', () => {
+  afterEach(() => vi.useRealTimers())
+
+  it.each(['DIRECT', 'RELAY'] as const)('rejects %s winners expiring before or after authorization without waiting for timers', async (source) => {
+    vi.useFakeTimers()
+    const relay = await relayPath()
+    const open = vi.spyOn(relay.requesterEndpoint, 'openCircuit')
+    try {
+      for (const expiry of ['before', 'after', 'delivery'] as const) {
+        let now = 0
+        const subsystem = new ConnectivitySubsystem()
+        const states: string[] = []
+        const onAuthorize = vi.fn(async () => {
+          if (expiry === 'after') now = 100
+          return { status: 'admitted' as const }
+        })
+        const secure = tcpTransportTestOnly.createSecurePreAuthorizationConnection({
+          expectedServerId: target.serverId, onAuthorize
+        })
+        const establish = vi.fn(async () => secure)
+        open.mockClear()
+        await expect(connectToServer({
+          ...base(), subsystem, overallTimeoutMs: 100, monotonicNowMs: () => now,
+          directSources: source === 'DIRECT' ? { descriptors: [descriptor()] } : undefined,
+          authorizedPeers: [{ relay: relay.requesterEndpoint }],
+          establishDirectConnection: establish,
+          establishRelayConnection: establish,
+          onStateChange: (state) => {
+            states.push(state)
+            if ((expiry === 'before' && state === 'AUTHORIZING') ||
+              (expiry === 'delivery' && state === 'CONNECTED')) now = 100
+          }
+        })).rejects.toMatchObject({ code: 'CONNECT_TIMEOUT' })
+        expect(onAuthorize).toHaveBeenCalledTimes(expiry === 'before' ? 0 : 1)
+        expect(establish).toHaveBeenCalledTimes(1)
+        expect(open).toHaveBeenCalledTimes(source === 'RELAY' ? 1 : 0)
+        expect(secure.isDestroyed()).toBe(true)
+        expect(states.at(-1)).toBe('ABORTED')
+        expect(subsystem.governor.snapshot().counts.SECURE_CONNECTION_ATTEMPT).toBe(0)
+        expect(subsystem.governor.snapshot().counts.CONNECT_OPERATION).toBe(0)
+      }
+    } finally {
+      relay.registration.close()
+    }
+  })
+
+  it.each(['DIRECT', 'DIRECT_ENRICHED', 'RELAY_CONNECTING'] as const)(
+    'does not clamp an exhausted %s child budget to one millisecond', async (phase) => {
+      vi.useFakeTimers()
+      const relay = await relayPath()
+      const open = vi.spyOn(relay.requesterEndpoint, 'openCircuit')
+      const establish = vi.fn()
+      let now = 0
+      try {
+        await expect(connectToServer({
+          ...base(), overallTimeoutMs: 100, monotonicNowMs: () => now,
+          directSources: phase === 'DIRECT' ? { descriptors: [descriptor()] } : undefined,
+          authorizedPeers: [
+            { relay: relay.requesterEndpoint },
+            ...(phase === 'DIRECT_ENRICHED' ? [{ rendezvous: rendezvousPath() }] : [])
+          ],
+          onStateChange: (state) => { if (state === phase) now = 100 },
+          establishDirectConnection: establish,
+          establishRelayConnection: establish
+        })).rejects.toMatchObject({ code: 'CONNECT_TIMEOUT' })
+        expect(establish).not.toHaveBeenCalled()
+        expect(open).not.toHaveBeenCalled()
+      } finally {
+        relay.registration.close()
+      }
+    }
+  )
+
+  it.each(['circuit', 'handshake'] as const)('destroys a late relay %s and starts no subsequent work', async (expiry) => {
+    vi.useFakeTimers()
+    const relay = await relayPath()
+    const subsystem = new ConnectivitySubsystem()
+    let now = 0
+    const openCircuit = relay.requesterEndpoint.openCircuit.bind(relay.requesterEndpoint)
+    let stream: Awaited<ReturnType<typeof openCircuit>> | undefined
+    vi.spyOn(relay.requesterEndpoint, 'openCircuit').mockImplementation(async (...args) => {
+      stream = await openCircuit(...args)
+      if (expiry === 'circuit') now = 100
+      return stream
+    })
+    const onAuthorize = vi.fn()
+    const secure = tcpTransportTestOnly.createSecurePreAuthorizationConnection({
+      expectedServerId: target.serverId, onAuthorize
+    })
+    const establish = vi.fn(async () => { now = 100; return secure })
+    try {
+      await expect(connectToServer({
+        ...base(), subsystem, overallTimeoutMs: 100, monotonicNowMs: () => now,
+        authorizedPeers: [{ relay: relay.requesterEndpoint }], establishRelayConnection: establish
+      })).rejects.toMatchObject({ code: 'CONNECT_TIMEOUT' })
+      expect(establish).toHaveBeenCalledTimes(expiry === 'circuit' ? 0 : 1)
+      expect(onAuthorize).not.toHaveBeenCalled()
+      expect(stream?.destroyed).toBe(true)
+      if (expiry === 'handshake') expect(secure.isDestroyed()).toBe(true)
+      expect(subsystem.governor.snapshot().counts.SECURE_CONNECTION_ATTEMPT).toBe(0)
+    } finally {
+      relay.registration.close()
+    }
+  })
+
+  it('enforces occupied global secure-attempt slots before opening any relay-only circuit', async () => {
+    const governor = new ConnectivityResourceGovernor()
+    const held = Array.from({ length: MAX_PENDING_SECURE_CONNECTION_ATTEMPTS }, () =>
+      governor.reserve('SECURE_CONNECTION_ATTEMPT'))
+    const subsystem = new ConnectivitySubsystem(governor)
+    const peers = [unavailableRelayPath(), unavailableRelayPath()]
+    const opens = peers.map((peer) => vi.spyOn(peer, 'openCircuit'))
+    const establish = vi.fn()
+    try {
+      await expect(connectToServer({
+        ...base(), subsystem, authorizedPeers: peers.map((relay) => ({ relay })),
+        establishRelayConnection: establish
+      })).rejects.toMatchObject({ code: 'CONNECT_PATH_UNAVAILABLE' })
+      for (const open of opens) expect(open).not.toHaveBeenCalled()
+      expect(establish).not.toHaveBeenCalled()
+      expect(governor.snapshot().counts.SECURE_CONNECTION_ATTEMPT).toBe(MAX_PENDING_SECURE_CONNECTION_ATTEMPTS)
+      expect(governor.snapshot().counts.CONNECT_OPERATION).toBe(0)
+    } finally {
+      for (const reservation of held) reservation.release()
+    }
+    expect(governor.snapshot().counts.SECURE_CONNECTION_ATTEMPT).toBe(0)
+  })
+
+  it.each(['open-error', 'handshake-error', 'auth-error', 'success', 'abort', 'shutdown'] as const)(
+    'holds a relay secure-attempt reservation through protected work and releases exactly once on %s', async (outcome) => {
+      const relay = await relayPath()
+      const subsystem = new ConnectivitySubsystem()
+      const governor = subsystem.governor
+      const reserve = governor.reserve.bind(governor)
+      const releases: ReturnType<typeof vi.spyOn>[] = []
+      vi.spyOn(governor, 'reserve').mockImplementation((category, amount) => {
+        const reservation = reserve(category, amount)
+        if (category === 'SECURE_CONNECTION_ATTEMPT') releases.push(vi.spyOn(reservation, 'release'))
+        return reservation
+      })
+      const controller = new AbortController()
+      const openCircuit = relay.requesterEndpoint.openCircuit.bind(relay.requesterEndpoint)
+      let stream: Awaited<ReturnType<typeof openCircuit>> | undefined
+      vi.spyOn(relay.requesterEndpoint, 'openCircuit').mockImplementation(async (...args) => {
+        expect(governor.snapshot().counts.SECURE_CONNECTION_ATTEMPT).toBe(1)
+        if (outcome === 'open-error') throw new Error('open failed')
+        stream = await openCircuit(...args)
+        return stream
+      })
+      let secure: ClientSecurePreAuthorizationConnection | undefined
+      try {
+        const operation = connectToServer({
+          ...base(), subsystem, signal: controller.signal,
+          authorizedPeers: [{ relay: relay.requesterEndpoint }],
+          establishRelayConnection: async () => {
+            expect(governor.snapshot().counts.SECURE_CONNECTION_ATTEMPT).toBe(1)
+            if (outcome === 'handshake-error') throw new Error('handshake failed')
+            secure = tcpTransportTestOnly.createSecurePreAuthorizationConnection({
+              expectedServerId: target.serverId,
+              onAuthorize: async () => {
+                expect(governor.snapshot().counts.SECURE_CONNECTION_ATTEMPT).toBe(1)
+                if (outcome === 'auth-error') throw new Error('auth failed')
+                if (outcome === 'abort') controller.abort()
+                if (outcome === 'shutdown') await subsystem.shutdown()
+                return { status: 'admitted' }
+              }
+            })
+            return secure
+          }
+        })
+        if (outcome === 'success') {
+          const result = await operation
+          expect(secure?.isDestroyed()).toBe(false)
+          result.destroy()
+        } else {
+          await expect(operation).rejects.toMatchObject({
+            code: outcome === 'abort' || outcome === 'shutdown' ? 'CONNECT_ABORTED'
+              : outcome === 'auth-error' ? 'CONNECT_TARGET_AUTHORIZATION_FAILED' : 'CONNECT_PATH_UNAVAILABLE'
+          })
+          if (secure) expect(secure.isDestroyed()).toBe(true)
+          if (stream) expect(stream.destroyed).toBe(true)
+        }
+        expect(governor.snapshot().counts.SECURE_CONNECTION_ATTEMPT).toBe(0)
+        expect(governor.snapshot().counts.CONNECT_OPERATION).toBe(0)
+        expect(releases).toHaveLength(1)
+        expect(releases[0]).toHaveBeenCalledTimes(1)
+        await subsystem.shutdown()
+        expect(releases[0]).toHaveBeenCalledTimes(1)
+      } finally {
+        stream?.destroy()
+        relay.registration.close()
+      }
+    }
+  )
+
+  it.each(['abort', 'shutdown'] as const)('cleans up a relay handshake resolving after %s without authorizing', async (outcome) => {
+    const relay = await relayPath()
+    const subsystem = new ConnectivitySubsystem()
+    const controller = new AbortController()
+    const onAuthorize = vi.fn()
+    const secure = tcpTransportTestOnly.createSecurePreAuthorizationConnection({
+      expectedServerId: target.serverId, onAuthorize
+    })
+    let stream: RelayTransportStream | undefined
+    try {
+      await expect(connectToServer({
+        ...base(), subsystem, signal: controller.signal,
+        authorizedPeers: [{ relay: relay.requesterEndpoint }],
+        establishRelayConnection: async (transport) => {
+          stream = transport
+          expect(subsystem.governor.snapshot().counts.SECURE_CONNECTION_ATTEMPT).toBe(1)
+          if (outcome === 'abort') controller.abort()
+          else await subsystem.shutdown()
+          expect(transport.destroyed).toBe(true)
+          return secure
+        }
+      })).rejects.toMatchObject({ code: 'CONNECT_ABORTED' })
+      expect(onAuthorize).not.toHaveBeenCalled()
+      expect(secure.isDestroyed()).toBe(true)
+      expect(subsystem.governor.snapshot().counts.SECURE_CONNECTION_ATTEMPT).toBe(0)
+      expect(subsystem.governor.snapshot().counts.CONNECT_OPERATION).toBe(0)
+    } finally {
+      stream?.destroy()
+      relay.registration.close()
+    }
+  })
+
   it('uses direct first and performs authorization exactly once on the cryptographic winner', async () => {
     const states: string[] = []
     const authorizations: string[] = []

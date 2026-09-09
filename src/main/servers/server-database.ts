@@ -174,11 +174,7 @@ export function initializeServerDatabase(
       publicKey: validatedOwnerKey
     })
   } catch (error) {
-    if (error instanceof ServerDatabaseError) {
-      throw error
-    }
-
-    throw new ServerDatabaseError('SERVER_DATABASE_INITIALIZATION_FAILED')
+    throw databaseWriteError(error, 'SERVER_DATABASE_INITIALIZATION_FAILED')
   } finally {
     if (db) {
       try {
@@ -250,11 +246,7 @@ export function openServerDatabase(
       }
     }
 
-    if (error instanceof ServerDatabaseError) {
-      throw error
-    }
-
-    throw new ServerDatabaseError('SERVER_DATABASE_CORRUPTED')
+    throw databaseWriteError(error, 'SERVER_DATABASE_CORRUPTED')
   }
 }
 
@@ -268,6 +260,17 @@ function validateDatabaseContent(
 }
 
 export function configurePragmas(db: DatabaseSync): void {
+  const { page_size: pageSize } = db.prepare('PRAGMA page_size;').get() as { page_size: number }
+  const maxPages = Math.floor(MAX_INITIAL_SERVER_DATABASE_BYTES / pageSize)
+  const { max_page_count: configuredMaxPages } = db
+    .prepare(`PRAGMA max_page_count = ${maxPages};`)
+    .get() as { max_page_count: number }
+
+  // SQLite cannot lower the limit below the existing page count.
+  if (configuredMaxPages > maxPages) {
+    throw new ServerDatabaseError('SERVER_DATABASE_TOO_LARGE')
+  }
+
   db.exec('PRAGMA foreign_keys = ON;')
   db.exec('PRAGMA trusted_schema = OFF;')
   db.exec('PRAGMA busy_timeout = 5000;')
@@ -320,23 +323,22 @@ function validateDatabaseIntegrityAndSchema(
       throw new ServerDatabaseError('SERVER_DATABASE_SCHEMA_INVALID')
     }
 
-    // Valida se v3 contém APENAS o Initial Owner
-    const v3Members = db.prepare('SELECT device_fingerprint, device_public_key FROM members;').all()
-    if (v3Members.length !== 1) {
-      throw new ServerDatabaseError('SERVER_MEMBERSHIP_MIGRATION_REQUIRES_READMISSION')
-    }
-
-    const ownerMember = parseAndValidateMemberRow(v3Members[0])
-    if (
-      ownerMember.deviceFingerprint !== expectedOwner.deviceFingerprint ||
-      !ownerMember.publicKey.equals(expectedOwner.publicKey)
-    ) {
-      throw new ServerDatabaseError('SERVER_MEMBERSHIP_STATE_INVALID')
-    }
-
     // Executa migração atômica para v4
     db.exec('BEGIN IMMEDIATE;')
     try {
+      const v3Members = db.prepare('SELECT device_fingerprint, device_public_key FROM members;').all()
+      if (v3Members.length !== 1) {
+        throw new ServerDatabaseError('SERVER_MEMBERSHIP_MIGRATION_REQUIRES_READMISSION')
+      }
+
+      const ownerMember = parseAndValidateMemberRow(v3Members[0])
+      if (
+        ownerMember.deviceFingerprint !== expectedOwner.deviceFingerprint ||
+        !ownerMember.publicKey.equals(expectedOwner.publicKey)
+      ) {
+        throw new ServerDatabaseError('SERVER_MEMBERSHIP_STATE_INVALID')
+      }
+
       db.exec(`
         CREATE TABLE member_certificates (
           device_fingerprint TEXT PRIMARY KEY
@@ -349,14 +351,17 @@ function validateDatabaseIntegrityAndSchema(
         );
       `)
       db.exec('PRAGMA user_version = 4;')
+      // Validate the complete v4 schema and data before making the migration durable.
+      validateDatabaseIntegrityAndSchema(db, expectedOwner, serverContext)
       db.exec('COMMIT;')
-    } catch {
+      return
+    } catch (error) {
       try {
         db.exec('ROLLBACK;')
       } catch {
         // Ignora
       }
-      throw new ServerDatabaseError('SERVER_DATABASE_SCHEMA_INVALID')
+      throw databaseWriteError(error, 'SERVER_DATABASE_SCHEMA_INVALID')
     }
   } else if (version !== DATABASE_SCHEMA_VERSION) {
     throw new ServerDatabaseError('SERVER_DATABASE_SCHEMA_INVALID')
@@ -364,7 +369,7 @@ function validateDatabaseIntegrityAndSchema(
 
   // Allowlist estrita de schema v4: exatamente 3 tabelas (invites, member_certificates, members)
   const schemaObjects = db
-    .prepare("SELECT type, name, tbl_name FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%' ORDER BY name ASC;")
+    .prepare("SELECT type, name, tbl_name FROM sqlite_schema WHERE name NOT GLOB 'sqlite_*' ORDER BY name ASC;")
     .all() as Array<{ type?: unknown; name?: unknown; tbl_name?: unknown }>
 
   if (
@@ -612,8 +617,8 @@ export function registerIssuedInvite(db: DatabaseSync, invite: ServerInvite): vo
       INSERT INTO invites (invite_id, invite_secret_hash, expires_at, max_uses, uses, revoked)
       VALUES (?, ?, ?, ?, 0, 0);
     `).run(invite.inviteId, secretHash, invite.expiresAt, invite.maxUses)
-  } catch {
-    throw new ServerDatabaseError('SERVER_INVITE_STATE_INVALID')
+  } catch (error) {
+    throw databaseWriteError(error, 'SERVER_INVITE_STATE_INVALID')
   }
 }
 
@@ -667,11 +672,16 @@ export function consumeServerInvite(
     throw new ServerDatabaseError('SERVER_INVITE_EXHAUSTED')
   }
 
-  const updateResult = db.prepare(`
-    UPDATE invites
-    SET uses = uses + 1
-    WHERE invite_id = ? AND revoked = 0 AND uses < max_uses;
-  `).run(verifiedInvite.inviteId) as { changes?: number }
+  let updateResult: { changes?: number | bigint }
+  try {
+    updateResult = db.prepare(`
+      UPDATE invites
+      SET uses = uses + 1
+      WHERE invite_id = ? AND revoked = 0 AND uses < max_uses;
+    `).run(verifiedInvite.inviteId)
+  } catch (error) {
+    throw databaseWriteError(error, 'SERVER_INVITE_STATE_INVALID')
+  }
 
   if (updateResult.changes !== 1) {
     const refreshed = db
@@ -809,11 +819,7 @@ export function admitMemberWithInvite(
       // Ignora erro no rollback
     }
 
-    if (error instanceof ServerDatabaseError) {
-      throw error
-    }
-
-    throw new ServerDatabaseError('SERVER_ADMISSION_FAILED')
+    throw databaseWriteError(error, 'SERVER_ADMISSION_FAILED')
   }
 }
 
@@ -822,11 +828,16 @@ export function revokeServerInvite(db: DatabaseSync, inviteId: string): void {
     throw new ServerDatabaseError('SERVER_INVITE_INVALID')
   }
 
-  const result = db.prepare(`
-    UPDATE invites
-    SET revoked = 1
-    WHERE invite_id = ?;
-  `).run(inviteId) as { changes?: number }
+  let result: { changes?: number | bigint }
+  try {
+    result = db.prepare(`
+      UPDATE invites
+      SET revoked = 1
+      WHERE invite_id = ?;
+    `).run(inviteId)
+  } catch (error) {
+    throw databaseWriteError(error, 'SERVER_INVITE_STATE_INVALID')
+  }
 
   if (result.changes !== 1) {
     throw new ServerDatabaseError('SERVER_INVITE_NOT_FOUND')
@@ -1043,6 +1054,15 @@ function validatePublicKeyDer(
   }
 
   return canonicalDer
+}
+
+function databaseWriteError(error: unknown, fallback: ServerDatabaseErrorCode): ServerDatabaseError {
+  if (error instanceof ServerDatabaseError) return error
+  // node:sqlite reports SQLITE_FULL with numeric errcode 13.
+  if (isRecord(error) && error.errcode === 13) {
+    return new ServerDatabaseError('SERVER_DATABASE_TOO_LARGE')
+  }
+  return new ServerDatabaseError(fallback)
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

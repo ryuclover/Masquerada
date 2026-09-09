@@ -384,18 +384,21 @@ export async function connectToServer(options: ConnectToServerOptions): Promise<
   const abortError = (): ConnectivityOrchestrationError => new ConnectivityOrchestrationError(
     timedOut ? 'CONNECT_TIMEOUT' : 'CONNECT_ABORTED'
   )
-  const ensureActive = (): void => {
-    if (remainingMs() <= 0) {
+  const ensureActive = (): number => {
+    const remaining = remainingMs()
+    if (remaining <= 0) {
       timedOut = true
       operationController.abort()
     }
     if (operationController.signal.aborted) throw abortError()
+    return remaining
   }
   const finish = (
     connection: ClientTcpPeerConnection,
     source: 'DIRECT' | 'RELAY',
     relayPeerId?: string
   ): ManagedServerConnection => {
+    ensureActive()
     if (settled) {
       connection.destroy()
       throw new ConnectivityOrchestrationError('CONNECT_SECURITY_INVALID')
@@ -409,8 +412,14 @@ export async function connectToServer(options: ConnectToServerOptions): Promise<
       () => unregister()
     )
     unregister = subsystem.registerResource({ close: () => managed.destroy(), forceClose: () => managed.destroy() })
+    try {
+      setState('CONNECTED')
+      ensureActive()
+    } catch (cause) {
+      managed.destroy()
+      throw cause
+    }
     settled = true
-    setState('CONNECTED')
     return managed
   }
   const authorizeTerminal = async (
@@ -423,14 +432,13 @@ export async function connectToServer(options: ConnectToServerOptions): Promise<
       secure.destroy()
       throw new ConnectivityOrchestrationError('CONNECT_SECURITY_INVALID')
     }
-    authorizationStarted = true
-    setState('AUTHORIZING')
     try {
+      ensureActive()
+      authorizationStarted = true
+      setState('AUTHORIZING')
+      ensureActive()
       const connection = await authorizeSecureConnection(secure, options.authorization, operationController.signal)
-      if (operationController.signal.aborted) {
-        connection.destroy()
-        throw abortError()
-      }
+      ensureActive()
       if (relay) {
         options.relaySuccessCache?.recordCryptographicSuccess(
           options.target.serverId,
@@ -443,6 +451,7 @@ export async function connectToServer(options: ConnectToServerOptions): Promise<
     } catch (cause) {
       secure.destroy()
       if (operationController.signal.aborted) throw abortError()
+      if (cause instanceof ConnectivityOrchestrationError) throw cause
       throw new ConnectivityOrchestrationError('CONNECT_TARGET_AUTHORIZATION_FAILED', { cause })
     }
   }
@@ -469,7 +478,7 @@ export async function connectToServer(options: ConnectToServerOptions): Promise<
           device: options.device,
           signal: operationController.signal,
           successCache: options.directSources?.candidateSuccessCache,
-          overallTimeoutMs: Math.max(1, Math.min(directPhaseTimeoutMs, remainingMs(), MAX_DIRECT_PHASE_TIMEOUT_MS)),
+          overallTimeoutMs: Math.min(directPhaseTimeoutMs, ensureActive(), MAX_DIRECT_PHASE_TIMEOUT_MS),
           nowSeconds: options.nowSeconds,
           monotonicNowMs: readMonotonicMs,
           establishConnection: options.establishDirectConnection
@@ -505,7 +514,7 @@ export async function connectToServer(options: ConnectToServerOptions): Promise<
         if (phaseRemaining <= 0) break
         try {
           const shareable = await peer.rendezvous!.requestDescriptor(options.target.serverId, {
-            timeoutMs: Math.max(1, Math.min(3000, phaseRemaining)),
+            timeoutMs: Math.min(3000, phaseRemaining, ensureActive()),
             signal: operationController.signal
           })
           const key = shareable.getDescriptorId().toString('hex')
@@ -528,7 +537,7 @@ export async function connectToServer(options: ConnectToServerOptions): Promise<
               device: options.device,
               signal: operationController.signal,
               successCache: options.directSources?.candidateSuccessCache,
-              overallTimeoutMs: Math.max(1, Math.min(directPhaseTimeoutMs, remainingMs(), MAX_DIRECT_PHASE_TIMEOUT_MS)),
+              overallTimeoutMs: Math.min(directPhaseTimeoutMs, ensureActive(), MAX_DIRECT_PHASE_TIMEOUT_MS),
               nowSeconds: options.nowSeconds,
               monotonicNowMs: readMonotonicMs,
               establishConnection: options.establishDirectConnection
@@ -550,7 +559,7 @@ export async function connectToServer(options: ConnectToServerOptions): Promise<
           const decision = decideConnectivityContinuation({
             failure: classifyConnectivityFailure(cause),
             phase: 'RENDEZVOUS',
-            authorizationStarted: false
+            authorizationStarted
           })
           if (decision !== 'NEXT_RENDEZVOUS') throw cause
           if (enrichedRaceUsed) break
@@ -584,12 +593,21 @@ export async function connectToServer(options: ConnectToServerOptions): Promise<
       const relayStartedAt = readMonotonicMs()
       let stream: RelayTransportStream | undefined
       let secure: ClientSecurePreAuthorizationConnection | undefined
+      let attemptReservation
+      const onRelayAbort = (): void => {
+        secure?.destroy()
+        stream?.destroy()
+      }
+      operationController.signal.addEventListener('abort', onRelayAbort, { once: true })
       try {
+        ensureActive()
+        attemptReservation = subsystem.governor.reserve('SECURE_CONNECTION_ATTEMPT')
         stream = await peer.relay!.openCircuit(options.target.serverId, {
-          timeoutMs: Math.max(1, Math.min(relayOpenTimeoutMs, remainingMs())),
+          timeoutMs: Math.min(relayOpenTimeoutMs, ensureActive()),
           signal: operationController.signal,
           autoRenew: true
         })
+        ensureActive()
         secure = await establishRelay(stream, {
           expectedServerId: options.target.serverId,
           expectedServerPublicKey: options.target.publicKey,
@@ -601,20 +619,24 @@ export async function connectToServer(options: ConnectToServerOptions): Promise<
           stream.destroy()
           continue
         }
+        return await authorizeTerminal(secure, 'RELAY', peer.relay!, relayStartedAt)
       } catch (cause) {
         secure?.destroy()
         stream?.destroy()
         if (operationController.signal.aborted) throw abortError()
+        if (cause instanceof ConnectivityOrchestrationError) throw cause
         const phase: ConnectivityFailurePhase = 'RELAY'
         const decision = decideConnectivityContinuation({
           failure: classifyConnectivityFailure(cause),
           phase,
-          authorizationStarted: false
+          authorizationStarted
         })
         if (decision !== 'NEXT_RELAY') throw cause
         continue
+      } finally {
+        operationController.signal.removeEventListener('abort', onRelayAbort)
+        attemptReservation?.release()
       }
-      return await authorizeTerminal(secure, 'RELAY', peer.relay!, relayStartedAt)
     }
 
     setState('FAILED')

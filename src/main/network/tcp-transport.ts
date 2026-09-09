@@ -25,6 +25,7 @@ import {
 } from './p2p-session'
 import {
   encodeProtocolFrame,
+  HEADER_LENGTH,
   ProtocolFrameDecoder,
   ProtocolFrameType,
   type ProtocolFrame
@@ -46,6 +47,8 @@ export const IDLE_TIMEOUT_MS = 30000
 export const MAX_INBOUND_CONNECTIONS = 64
 export const MAX_CONNECTIONS_PER_IP = 16
 export const MAX_PENDING_WRITE_BYTES = 1024 * 1024 // 1 MB
+export const MAX_PENDING_READ_FRAMES = 256
+export const MAX_PENDING_READ_BYTES = 1024 * 1024 // Includes headers and the frame being processed.
 
 export type TcpTransportErrorCode =
   | 'TCP_INVALID_HOST'
@@ -56,6 +59,7 @@ export type TcpTransportErrorCode =
   | 'TCP_PROTOCOL_VIOLATION'
   | 'TCP_WRONG_FRAME_TYPE'
   | 'TCP_BACKPRESSURE_OVERFLOW'
+  | 'TCP_READ_QUEUE_OVERFLOW'
   | 'TCP_CONNECTION_CLOSED'
   | 'TCP_CONNECTION_FAILED'
   | 'TCP_LISTENER_FAILED'
@@ -77,6 +81,7 @@ const ERROR_MESSAGES: Record<TcpTransportErrorCode, string> = {
   TCP_PROTOCOL_VIOLATION: 'Violação de protocolo detectada no stream TCP.',
   TCP_WRONG_FRAME_TYPE: 'Tipo de frame inesperado recebido para o estado atual da conexão.',
   TCP_BACKPRESSURE_OVERFLOW: 'A fila de escrita do socket excedeu o limite máximo de bytes pendentes.',
+  TCP_READ_QUEUE_OVERFLOW: 'O limite de frames ou bytes pendentes de leitura foi excedido.',
   TCP_CONNECTION_CLOSED: 'A conexão TCP foi encerrada.',
   TCP_CONNECTION_FAILED: 'Falha ao estabelecer ou manter a conexão TCP.',
   TCP_LISTENER_FAILED: 'Falha ao inicializar o listener TCP.',
@@ -278,7 +283,13 @@ export class AuthorizedPeerChannel {
     this.closed = true
     this.messageHandler = undefined
     this.typedMessageHandlers.clear()
-    for (const handler of this.closeHandlers) handler()
+    for (const handler of this.closeHandlers) {
+      try {
+        handler()
+      } catch {
+        // A consumer must not interrupt transport/key cleanup.
+      }
+    }
     this.closeHandlers.clear()
   }
 
@@ -302,7 +313,7 @@ export function isAuthorizedPeerChannel(value: unknown): value is AuthorizedPeer
 export class ServerTcpPeerConnection {
   private state: ServerConnectionState = 'CONNECTED'
   private readonly socket: Socket | MasqueradaTransportStream
-  private readonly decoder = new ProtocolFrameDecoder()
+  private decoder: ProtocolFrameDecoder | null = new ProtocolFrameDecoder()
   private currentTimer: NodeJS.Timeout | null = null
   private session: SecureSession | null = null
   private isDestroyed = false
@@ -359,7 +370,7 @@ export class ServerTcpPeerConnection {
 
     this.socket.on('end', () => {
       try {
-        this.decoder.finish()
+        this.decoder?.finish()
       } catch {
         // Frame truncado
       }
@@ -376,6 +387,7 @@ export class ServerTcpPeerConnection {
   }
 
   private setTimer(ms: number, onTimeout: () => void): void {
+    if (this.isDestroyed) return
     this.clearTimer()
     this.currentTimer = setTimeout(() => {
       onTimeout()
@@ -403,10 +415,12 @@ export class ServerTcpPeerConnection {
   }
 
   private readonly frameQueue: ProtocolFrame[] = []
+  private pendingReadFrames = 0
+  private pendingReadBytes = 0
   private isProcessingFrames = false
 
   private handleData(chunk: Buffer): void {
-    if (this.isDestroyed) return
+    if (this.isDestroyed || !this.decoder) return
 
     let frames: ProtocolFrame[]
     try {
@@ -417,6 +431,14 @@ export class ServerTcpPeerConnection {
     }
 
     for (const frame of frames) {
+      const bytes = HEADER_LENGTH + frame.payload.length
+      if (this.pendingReadFrames >= MAX_PENDING_READ_FRAMES ||
+          this.pendingReadBytes + bytes > MAX_PENDING_READ_BYTES) {
+        this.destroy()
+        return
+      }
+      this.pendingReadFrames += 1
+      this.pendingReadBytes += bytes
       this.frameQueue.push(frame)
     }
 
@@ -430,7 +452,12 @@ export class ServerTcpPeerConnection {
     try {
       while (this.frameQueue.length > 0 && !this.isDestroyed) {
         const frame = this.frameQueue.shift()!
+        const bytes = HEADER_LENGTH + frame.payload.length
         await this.processFrame(frame)
+        if (!this.isDestroyed) {
+          this.pendingReadFrames -= 1
+          this.pendingReadBytes -= bytes
+        }
       }
     } finally {
       this.isProcessingFrames = false
@@ -488,8 +515,10 @@ export class ServerTcpPeerConnection {
       )
 
       // Transição para SESSION_SETUP
+      if (this.isDestroyed) return
       this.state = 'SESSION_SETUP'
       this.serverSessionSetup = new ServerSessionSetup(this.establishedContext)
+      this.serverHandshake = null
       this.setTimer(this.sessionSetupTimeoutMs, () => {
         this.destroy()
       })
@@ -516,6 +545,7 @@ export class ServerTcpPeerConnection {
       const { serverKeyConfirm, session } =
         this.serverSessionSetup.processClientKeyConfirm(frame.payload)
       this.session = session
+      this.serverSessionSetup = null
 
       await this.writeFrame(
         encodeProtocolFrame({
@@ -525,6 +555,7 @@ export class ServerTcpPeerConnection {
       )
 
       // Transição para SECURE_UNADMITTED / ADMISSION
+      if (this.isDestroyed) return
       this.state = 'SECURE_UNADMITTED'
       if (!this.establishedContext) {
         throw new TcpTransportError('TCP_PROTOCOL_VIOLATION')
@@ -557,6 +588,7 @@ export class ServerTcpPeerConnection {
     )
 
     await this.writeRawBuffer(result.responseFrame)
+    if (this.isDestroyed) return
 
     if (result.status === 'admitted' || result.status === 'already_member' || result.status === 'authorized') {
       this.clearTimer()
@@ -588,6 +620,7 @@ export class ServerTcpPeerConnection {
     }
     const plaintext = this.session.decrypt(frame.payload)
     await this.authorizedChannel.dispatch(AUTHORIZED_CHANNEL_TOKEN, plaintext)
+    if (!this.isDestroyed && this.state === 'MEMBER_CONNECTED') this.currentTimer?.refresh()
   }
 
   private async writeAuthorizedPlaintext(plaintext: Buffer): Promise<void> {
@@ -595,6 +628,7 @@ export class ServerTcpPeerConnection {
       throw new TcpTransportError('TCP_PROTOCOL_VIOLATION')
     }
     await this.writeRawBuffer(encodeSessionFrame(this.session.encrypt(plaintext)))
+    if (!this.isDestroyed && this.state === 'MEMBER_CONNECTED') this.currentTimer?.refresh()
   }
 
   async writeFrame(frame: Buffer): Promise<void> {
@@ -658,6 +692,14 @@ export class ServerTcpPeerConnection {
     this.state = 'CLOSED'
     this.clearTimer()
     this.frameQueue.length = 0
+    this.pendingReadFrames = 0
+    this.pendingReadBytes = 0
+    this.decoder = null
+    this.serverSessionSetup?.destroy()
+    this.serverSessionSetup = null
+    this.serverHandshake = null
+    this.serverAuthorizationRouter = null
+    this.establishedContext = null
     this.authorizedChannel?.close(AUTHORIZED_CHANNEL_TOKEN)
     this.authorizedChannel = null
 
@@ -909,7 +951,7 @@ export const tcpTransportTestOnly = Object.freeze({
 export class ClientTcpPeerConnection {
   private state: ClientConnectionState = 'CONNECTING'
   private readonly socket: Socket | MasqueradaTransportStream
-  private readonly decoder = new ProtocolFrameDecoder()
+  private decoder: ProtocolFrameDecoder | null = new ProtocolFrameDecoder()
   private currentTimer: NodeJS.Timeout | null = null
   private session: SecureSession | null = null
   private isDestroyed = false
@@ -1040,7 +1082,7 @@ export class ClientTcpPeerConnection {
 
     this.socket.on('end', () => {
       try {
-        this.decoder.finish()
+        this.decoder?.finish()
       } catch {
         // Frame truncado
       }
@@ -1057,6 +1099,7 @@ export class ClientTcpPeerConnection {
   }
 
   private setTimer(ms: number, onTimeout: () => void): void {
+    if (this.isDestroyed) return
     this.clearTimer()
     this.currentTimer = setTimeout(() => {
       onTimeout()
@@ -1071,6 +1114,7 @@ export class ClientTcpPeerConnection {
   }
 
   private async startHandshake(): Promise<void> {
+    if (this.isDestroyed) return
     this.state = 'HANDSHAKE'
     this.clientHandshake = new ClientHandshake({
       expectedServerId: this.expectedServerId,
@@ -1090,10 +1134,12 @@ export class ClientTcpPeerConnection {
   }
 
   private readonly frameQueue: ProtocolFrame[] = []
+  private pendingReadFrames = 0
+  private pendingReadBytes = 0
   private isProcessingFrames = false
 
   private handleData(chunk: Buffer): void {
-    if (this.isDestroyed) return
+    if (this.isDestroyed || !this.decoder) return
 
     let frames: ProtocolFrame[]
     try {
@@ -1104,6 +1150,14 @@ export class ClientTcpPeerConnection {
     }
 
     for (const frame of frames) {
+      const bytes = HEADER_LENGTH + frame.payload.length
+      if (this.pendingReadFrames >= MAX_PENDING_READ_FRAMES ||
+          this.pendingReadBytes + bytes > MAX_PENDING_READ_BYTES) {
+        this.failAndDestroy(new TcpTransportError('TCP_READ_QUEUE_OVERFLOW'))
+        return
+      }
+      this.pendingReadFrames += 1
+      this.pendingReadBytes += bytes
       this.frameQueue.push(frame)
     }
 
@@ -1117,7 +1171,12 @@ export class ClientTcpPeerConnection {
     try {
       while (this.frameQueue.length > 0 && !this.isDestroyed) {
         const frame = this.frameQueue.shift()!
+        const bytes = HEADER_LENGTH + frame.payload.length
         await this.processFrame(frame)
+        if (!this.isDestroyed) {
+          this.pendingReadFrames -= 1
+          this.pendingReadBytes -= bytes
+        }
       }
     } finally {
       this.isProcessingFrames = false
@@ -1169,6 +1228,7 @@ export class ClientTcpPeerConnection {
       // Transição para SESSION_SETUP
       this.state = 'SESSION_SETUP'
       this.clientSessionSetup = new ClientSessionSetup(this.establishedContext)
+      this.clientHandshake = null
       this.setTimer(this.sessionSetupTimeoutMs, () => {
         this.failAndDestroy(new TcpTransportError('TCP_TIMEOUT'))
       })
@@ -1201,6 +1261,7 @@ export class ClientTcpPeerConnection {
       )
     } else if (setupState === 'WAITING_SERVER_KEY_CONFIRM') {
       this.session = this.clientSessionSetup.processServerKeyConfirm(frame.payload)
+      this.clientSessionSetup = null
 
       // Transição para ADMISSION
       this.state = 'SECURE_UNAUTHORIZED'
@@ -1279,6 +1340,7 @@ export class ClientTcpPeerConnection {
     }
     const plaintext = this.session.decrypt(frame.payload)
     await this.authorizedChannel.dispatch(AUTHORIZED_CHANNEL_TOKEN, plaintext)
+    if (!this.isDestroyed && this.state === 'MEMBER_CONNECTED') this.currentTimer?.refresh()
   }
 
   private async writeAuthorizedPlaintext(plaintext: Buffer): Promise<void> {
@@ -1286,6 +1348,7 @@ export class ClientTcpPeerConnection {
       throw new TcpTransportError('TCP_PROTOCOL_VIOLATION')
     }
     await this.writeRawBuffer(encodeSessionFrame(this.session.encrypt(plaintext)))
+    if (!this.isDestroyed && this.state === 'MEMBER_CONNECTED') this.currentTimer?.refresh()
   }
 
   async writeFrame(frame: Buffer): Promise<void> {
@@ -1401,6 +1464,15 @@ export class ClientTcpPeerConnection {
     this.clearTimer()
     this.callerSignal?.removeEventListener('abort', this.onCallerAbort)
     this.frameQueue.length = 0
+    this.pendingReadFrames = 0
+    this.pendingReadBytes = 0
+    this.decoder = null
+    this.clientSessionSetup?.destroy()
+    this.clientSessionSetup = null
+    this.clientHandshake = null
+    this.clientAdmissionFlow = null
+    this.clientReconnectFlow = null
+    this.establishedContext = null
     this.authorizedChannel?.close(AUTHORIZED_CHANNEL_TOKEN)
     this.authorizedChannel = null
 
@@ -1426,6 +1498,15 @@ export class ClientTcpPeerConnection {
     this.clearTimer()
     this.callerSignal?.removeEventListener('abort', this.onCallerAbort)
     this.frameQueue.length = 0
+    this.pendingReadFrames = 0
+    this.pendingReadBytes = 0
+    this.decoder = null
+    this.clientSessionSetup?.destroy()
+    this.clientSessionSetup = null
+    this.clientHandshake = null
+    this.clientAdmissionFlow = null
+    this.clientReconnectFlow = null
+    this.establishedContext = null
     this.authorizedChannel?.close(AUTHORIZED_CHANNEL_TOKEN)
     this.authorizedChannel = null
 

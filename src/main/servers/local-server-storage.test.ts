@@ -239,7 +239,7 @@ describe('filesystem local de servidores', () => {
       throw error
     }
 
-    await expectStorageError(fixture.storage.loadLocalServer(FIRST_ID), 'SERVER_METADATA_CORRUPTED')
+    await expectStorageError(fixture.storage.loadLocalServer(FIRST_ID), 'SERVER_PATH_UNSAFE')
   })
 
   it('rejeita o diretório do servidor como junction quando reproduzível', async () => {

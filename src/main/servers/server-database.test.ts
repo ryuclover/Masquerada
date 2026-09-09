@@ -1,5 +1,5 @@
 import { createHash, generateKeyPairSync } from 'node:crypto'
-import { mkdtemp, rm } from 'node:fs/promises'
+import { mkdtemp, readFile, rm, stat } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
@@ -18,9 +18,11 @@ import {
   getStoredInvite,
   initializeServerDatabase,
   listMembers,
+  MAX_INITIAL_SERVER_DATABASE_BYTES,
   openServerDatabase,
   registerIssuedInvite,
   revokeServerInvite,
+  ServerDatabaseError,
   validateServerDatabaseFile,
   verifyPersistedMemberAuthorization
 } from './server-database'
@@ -54,7 +56,7 @@ describe('fundação segura de SQLite, membership, invites, certificates e admis
     const foreignKeys = db.prepare('PRAGMA foreign_keys;').get() as { foreign_keys: number }
     const trustedSchema = db.prepare('PRAGMA trusted_schema;').get() as { trusted_schema: number }
     const schemaObjects = db
-      .prepare("SELECT type, name, tbl_name FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%' ORDER BY name ASC;")
+      .prepare("SELECT type, name, tbl_name FROM sqlite_schema WHERE name NOT GLOB 'sqlite_*' ORDER BY name ASC;")
       .all()
     const members = listMembers(db)
     const certs = db.prepare('SELECT COUNT(*) as count FROM member_certificates;').get() as { count: number }
@@ -327,6 +329,62 @@ describe('fundação segura de SQLite, membership, invites, certificates e admis
   })
 
   describe('testes de segurança, DB tampering e migração (v3 -> v4)', () => {
+    it.each(['backdoor', 'sqlitex_hidden', 'SQLITEX_hidden'])('rejeita trigger inesperado %s sem alterar o banco', async (triggerName) => {
+      const root = await createTempDir()
+      const dbPath = join(root, DATABASE_FILE_NAME)
+      const owner = createTestDeviceIdentity()
+      initializeServerDatabase(dbPath, owner)
+      const raw = new DatabaseSync(dbPath)
+      raw.exec(`CREATE TRIGGER ${triggerName} AFTER UPDATE ON invites BEGIN DELETE FROM members; END;`)
+      raw.close()
+      const before = await readFile(dbPath)
+
+      await expect(validateServerDatabaseFile(dbPath)).rejects.toMatchObject({
+        code: 'SERVER_DATABASE_SCHEMA_INVALID'
+      })
+      expect(await readFile(dbPath)).toEqual(before)
+    })
+
+    it.each(['schema', 'invite', 'column'])('preserva schema v3 e todos os bytes quando a validacao de %s falha', async (failure) => {
+      const root = await createTempDir()
+      const dbPath = join(root, DATABASE_FILE_NAME)
+      const owner = createTestDeviceIdentity()
+      initializeServerDatabase(dbPath, owner)
+      const raw = new DatabaseSync(dbPath)
+      raw.exec('DROP TABLE member_certificates; PRAGMA user_version = 3;')
+      raw.prepare(`INSERT INTO invites VALUES (?, ?, 2000000000, 3, 1, 0);`).run(
+        'a'.repeat(32), Buffer.alloc(32, 1)
+      )
+      if (failure === 'schema') {
+        raw.exec('CREATE TRIGGER sqlitex_hidden AFTER UPDATE ON invites BEGIN DELETE FROM members; END;')
+      } else if (failure === 'column') {
+        raw.exec('ALTER TABLE invites RENAME COLUMN invite_secret_hash TO unexpected_hash;')
+      } else {
+        raw.exec("UPDATE invites SET invite_secret_hash = X'01';")
+      }
+      raw.close()
+      const before = await readFile(dbPath)
+
+      for (let attempt = 0; attempt < 2; attempt++) {
+        await expect(validateServerDatabaseFile(dbPath, {
+          deviceFingerprint: owner.fingerprint,
+          publicKey: owner.publicKey
+        })).rejects.toMatchObject({
+          code: failure === 'invite' ? 'SERVER_INVITE_STATE_INVALID' : 'SERVER_DATABASE_SCHEMA_INVALID'
+        })
+        expect(await readFile(dbPath)).toEqual(before)
+      }
+
+      const unchanged = new DatabaseSync(dbPath)
+      try {
+        expect(unchanged.prepare('PRAGMA user_version;').get()).toMatchObject({ user_version: 3 })
+        expect(unchanged.prepare("SELECT name FROM sqlite_schema WHERE name = 'member_certificates';").get()).toBeUndefined()
+        expect(unchanged.prepare('SELECT COUNT(*) AS count FROM invites;').get()).toMatchObject({ count: 1 })
+      } finally {
+        unchanged.close()
+      }
+    })
+
     it('(36) DB Tampering: atacante injeta linha em members sem certificado -> validação e autorização falham fechadas', async () => {
       const fixture = createServerFixture()
       const root = await createTempDir()
@@ -441,6 +499,11 @@ describe('fundação segura de SQLite, membership, invites, certificates e admis
         fixture.ownerDevice.publicKey
       )
       dbV3.exec('PRAGMA user_version = 3;')
+      dbV3.prepare('INSERT INTO invites VALUES (?, ?, 2000000000, 3, 1, 1);').run(
+        'a'.repeat(32), Buffer.alloc(32, 1)
+      )
+      const originalMembers = dbV3.prepare('SELECT * FROM members;').all()
+      const originalInvites = dbV3.prepare('SELECT * FROM invites;').all()
       dbV3.close()
 
       // Abrir o banco com expectedOwner migra de forma segura para v4
@@ -454,6 +517,8 @@ describe('fundação segura de SQLite, membership, invites, certificates e admis
 
       const certCount = dbMigrated.prepare('SELECT COUNT(*) as count FROM member_certificates;').get() as { count: number }
       expect(certCount.count).toBe(0)
+      expect(dbMigrated.prepare('SELECT * FROM members;').all()).toEqual(originalMembers)
+      expect(dbMigrated.prepare('SELECT * FROM invites;').all()).toEqual(originalInvites)
       dbMigrated.close()
     })
 
@@ -503,6 +568,124 @@ describe('fundação segura de SQLite, membership, invites, certificates e admis
       ).toThrowError(expect.objectContaining({ code: 'SERVER_MEMBERSHIP_MIGRATION_REQUIRES_READMISSION' }))
     })
   })
+
+  it('rejeita SQLite valido ja acima da capacidade sem truncar dados', async () => {
+    const owner = createTestDeviceIdentity()
+    const dbPath = join(await createTempDir(), DATABASE_FILE_NAME)
+    initializeServerDatabase(dbPath, owner)
+    // An external connection is not subject to the application connection's page limit.
+    const raw = new DatabaseSync(dbPath)
+    try {
+      raw.exec(`
+        WITH RECURSIVE ids(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM ids WHERE n < 14000)
+        INSERT INTO invites
+        SELECT printf('%032x', n), zeroblob(32), 2000000000, 3, 0, 0 FROM ids;
+      `)
+      expect(raw.prepare('PRAGMA quick_check;').get()).toMatchObject({ quick_check: 'ok' })
+    } finally {
+      raw.close()
+    }
+    const before = await readFile(dbPath)
+    expect(before.length).toBeGreaterThan(MAX_INITIAL_SERVER_DATABASE_BYTES)
+    expect(() => openServerDatabase(dbPath)).toThrowError(expect.objectContaining({ code: 'SERVER_DATABASE_TOO_LARGE' }))
+    await expect(validateServerDatabaseFile(dbPath)).rejects.toMatchObject({ code: 'SERVER_DATABASE_TOO_LARGE' })
+    expect(await readFile(dbPath)).toEqual(before)
+  }, 30000)
+
+  it.each([512, 4096, 65536])('limita crescimento SQLite com paginas de %i bytes e reverte admissao sem perder dados', async (pageSize) => {
+    const fixture = createServerFixture()
+    const dbPath = join(await createTempDir(), DATABASE_FILE_NAME)
+    initializeServerDatabase(dbPath, fixture.ownerDevice)
+    const raw = new DatabaseSync(dbPath)
+    raw.exec(`PRAGMA page_size = ${pageSize}; VACUUM;`)
+    raw.close()
+    const initialSize = (await stat(dbPath)).size
+    const expectedOwner = {
+      deviceFingerprint: fixture.ownerDevice.fingerprint,
+      publicKey: fixture.ownerDevice.publicKey
+    }
+    const serverContext = { serverId: fixture.serverId, serverPublicKey: fixture.serverPublicKey }
+    const invite = createServerInvite(fixture.serverId, fixture.serverPrivateKey, fixture.ownerDevice, {
+      expiresAt: 2000000000,
+      maxUses: 10000
+    })
+    const db = openServerDatabase(dbPath, expectedOwner, serverContext)
+    let persistedInvites = 1
+    try {
+      expect(db.prepare('PRAGMA page_size;').get()).toMatchObject({ page_size: pageSize })
+      expect(db.prepare('PRAGMA max_page_count;').get()).toMatchObject({
+        max_page_count: Math.floor(MAX_INITIAL_SERVER_DATABASE_BYTES / pageSize)
+      })
+      registerIssuedInvite(db, invite)
+
+      // Commit bounded batches, then fill the remaining space with individual writes.
+      let full = false
+      for (const batchSize of [100, 1]) {
+        full = false
+        while (!full && persistedInvites < 20000) {
+          db.exec('BEGIN IMMEDIATE;')
+          try {
+            for (let offset = 0; offset < batchSize; offset++) {
+              registerIssuedInvite(db, {
+                ...invite,
+                inviteId: (persistedInvites + offset).toString(16).padStart(32, '0')
+              })
+            }
+            db.exec('COMMIT;')
+            persistedInvites += batchSize
+          } catch (error) {
+            // SQLITE_FULL may already have rolled back the entire transaction.
+            try { db.exec('ROLLBACK;') } catch { /* Already rolled back. */ }
+            expect(error).toBeInstanceOf(ServerDatabaseError)
+            expect(error).toMatchObject({ code: 'SERVER_DATABASE_TOO_LARGE' })
+            full = true
+          }
+        }
+        expect(full).toBe(true)
+        expect(db.prepare('SELECT COUNT(*) AS count FROM invites;').get()).toMatchObject({ count: persistedInvites })
+      }
+
+      let admissionRejected = false
+      for (let attempt = 0; attempt < 1000; attempt++) {
+        const candidate = createTestDeviceIdentity()
+        const before = {
+          members: db.prepare('SELECT * FROM members ORDER BY device_fingerprint;').all(),
+          certificates: db.prepare('SELECT * FROM member_certificates ORDER BY device_fingerprint;').all(),
+          invite: getStoredInvite(db, invite.inviteId)
+        }
+        try {
+          admitMemberWithInvite(db, invite, candidate, fixture.serverId, fixture.serverPublicKey, fixture.serverPrivateKey)
+        } catch (error) {
+          expect(error).toMatchObject({ code: 'SERVER_DATABASE_TOO_LARGE' })
+          expect(getMemberByFingerprint(db, candidate.fingerprint)).toBeUndefined()
+          expect(db.prepare('SELECT * FROM members ORDER BY device_fingerprint;').all()).toEqual(before.members)
+          expect(db.prepare('SELECT * FROM member_certificates ORDER BY device_fingerprint;').all()).toEqual(before.certificates)
+          expect(getStoredInvite(db, invite.inviteId)).toEqual(before.invite)
+          admissionRejected = true
+          break
+        }
+      }
+      expect(admissionRejected).toBe(true)
+      expect(db.prepare('PRAGMA quick_check;').get()).toMatchObject({ quick_check: 'ok' })
+      // No transaction is left open after the failed admission.
+      db.exec('BEGIN IMMEDIATE; ROLLBACK;')
+    } finally {
+      db.close()
+    }
+
+    expect((await stat(dbPath)).size).toBeGreaterThan(initialSize)
+    expect((await stat(dbPath)).size).toBeLessThanOrEqual(MAX_INITIAL_SERVER_DATABASE_BYTES)
+    await expect(validateServerDatabaseFile(dbPath, expectedOwner, serverContext)).resolves.toBeUndefined()
+    const reopened = openServerDatabase(dbPath, expectedOwner, serverContext)
+    try {
+      expect(reopened.prepare('PRAGMA max_page_count;').get()).toMatchObject({
+        max_page_count: Math.floor(MAX_INITIAL_SERVER_DATABASE_BYTES / pageSize)
+      })
+      expect(reopened.prepare('SELECT COUNT(*) AS count FROM invites;').get()).toMatchObject({ count: persistedInvites })
+    } finally {
+      reopened.close()
+    }
+  }, 30000)
 })
 
 function createTestDeviceIdentity() {
