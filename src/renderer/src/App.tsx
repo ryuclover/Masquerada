@@ -143,6 +143,72 @@ function IconClose(): React.JSX.Element {
   )
 }
 
+function IconMasqueradaLogo(): React.JSX.Element {
+  return (
+    <svg width="28" height="28" viewBox="0 0 48 48" fill="none" className="rail-mask-svg" aria-hidden="true">
+      <defs>
+        <linearGradient id="masqGrad" x1="4" y1="4" x2="44" y2="44" gradientUnits="userSpaceOnUse">
+          <stop stopColor="#FDE68A" />
+          <stop offset="0.45" stopColor="#F59E0B" />
+          <stop offset="1" stopColor="#B45309" />
+        </linearGradient>
+        <linearGradient id="masqEye" x1="10" y1="18" x2="38" y2="30" gradientUnits="userSpaceOnUse">
+          <stop stopColor="#090810" />
+          <stop offset="1" stopColor="#1e1833" />
+        </linearGradient>
+        <filter id="masqGlow" x="-20%" y="-20%" width="140%" height="140%">
+          <feDropShadow dx="0" dy="2" stdDeviation="3" floodColor="rgba(0,0,0,0.6)" />
+        </filter>
+      </defs>
+      {/* Máscara Teatral Veneziana Principal */}
+      <path
+        d="M24 6C15 6 6 12 4 19C2 26 5 33 11 38C17 43 22 45 24 45C26 45 31 43 37 38C43 33 46 26 44 19C42 12 33 6 24 6Z"
+        fill="url(#masqGrad)"
+        filter="url(#masqGlow)"
+      />
+      {/* Detalhe Superior da Coroa de Carnaval */}
+      <path
+        d="M24 6L21 12H27L24 6ZM14 9L13 14H18L17 9H14ZM34 9L31 9L30 14H35L34 9Z"
+        fill="#FEF3C7"
+        opacity="0.9"
+      />
+      {/* Olho Esquerdo Enigmático */}
+      <path
+        d="M10.5 22C13.5 19.5 17.5 19.5 19.5 23.5C17.5 26.5 13.5 26.5 10.5 24.5C9.2 23.5 9.2 22.8 10.5 22Z"
+        fill="url(#masqEye)"
+      />
+      {/* Olho Direito Enigmático */}
+      <path
+        d="M37.5 22C34.5 19.5 30.5 19.5 28.5 23.5C30.5 26.5 34.5 26.5 37.5 24.5C38.8 23.5 38.8 22.8 37.5 22Z"
+        fill="url(#masqEye)"
+      />
+      {/* Ponte Nasal Veneziana */}
+      <path
+        d="M24 20V32M22 32H26"
+        stroke="#78350F"
+        strokeWidth="1.5"
+        strokeLinecap="round"
+      />
+      {/* Arabescos e Filigranas Douradas nas Bochechas */}
+      <path
+        d="M8 29C10 33 14 36 18 36M40 29C38 33 34 36 30 36"
+        stroke="#FEF3C7"
+        strokeWidth="1.6"
+        strokeLinecap="round"
+        opacity="0.85"
+      />
+    </svg>
+  )
+}
+
+function formatChannelDisplayName(name: string, type?: 'text' | 'voice'): string {
+  if (type === 'voice' || name.startsWith('voz-')) {
+    const clean = name.replace(/^voz-/, '').replace(/[-_]+/g, ' ')
+    return clean.replace(/\b\w/g, (char) => char.toUpperCase())
+  }
+  return name
+}
+
 function IconSparkles(): React.JSX.Element {
   return (
     <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
@@ -497,12 +563,20 @@ export default function App(): React.JSX.Element {
   useEffect(() => {
     if (!server || !api) return
     void api.listChannels(server.localStorageId).then((items) => {
-      setChannels(items)
-      if (!selectedChannel && items[0]) setSelectedChannel(items[0].channelId)
+      const typed = items.map((c) => ({
+        ...c,
+        type: (c.type ?? (c.name.startsWith('voz-') ? 'voice' : 'text')) as 'text' | 'voice'
+      }))
+      setChannels(typed)
+      setSelectedChannel((prev) => {
+        if (prev && typed.some((ch) => ch.channelId === prev)) return prev
+        const firstText = typed.find((ch) => ch.type === 'text')
+        return firstText?.channelId ?? typed[0]?.channelId
+      })
     }).catch(() => setError('Não foi possível carregar os canais.'))
     void api.listMembers(server.localStorageId).then(setMembers).catch(() => setError('Não foi possível carregar os membros.'))
     void api.listInvites(server.localStorageId).then(setInvites).catch(() => setError('Não foi possível carregar os convites.'))
-  }, [api, server, selectedChannel])
+  }, [api, server?.localStorageId])
 
   // Carregar amigos
   useEffect(() => {
@@ -643,22 +717,56 @@ export default function App(): React.JSX.Element {
     const targetType = forcedType ?? channelType
     try {
       setBusy(true)
+      setError(undefined)
+
+      const rawSlug = channelName
+        .trim()
+        .toLowerCase()
+        .normalize('NFC')
+        .replace(/[\s_]+/g, '-')
+        .replace(/[^a-z0-9-áàâãéèêíïóôõöúçñ]/gi, '')
+        .replace(/^-+|-+$/g, '')
+
+      if (!rawSlug) {
+        setError('Nome do canal inválido. Digite ao menos uma letra ou número.')
+        return
+      }
+
       const formattedName =
-        targetType === 'text'
-          ? channelName.trim().toLowerCase().replace(/\s+/g, '-')
-          : channelName.trim()
+        targetType === 'voice'
+          ? (rawSlug.startsWith('voz-') ? rawSlug : `voz-${rawSlug}`)
+          : rawSlug
+
+      // Verifica duplicidade local prévia
+      const exists = channels.some((c) => c.name.toLowerCase() === formattedName.toLowerCase())
+      if (exists) {
+        setError(`Já existe um canal de ${targetType === 'voice' ? 'voz' : 'texto'} com esse nome neste servidor.`)
+        return
+      }
+
       const channel = await api.createChannel(server.localStorageId, formattedName, targetType)
-      setChannels((current) => [...current, channel])
+      const channelWithType = {
+        ...channel,
+        type: targetType
+      }
+      setChannels((current) => [...current.filter((c) => c.channelId !== channel.channelId), channelWithType])
       if (targetType === 'text') {
         setSelectedChannel(channel.channelId)
       } else {
-        handleJoinVoiceChannel(channel)
+        handleJoinVoiceChannel(channelWithType)
       }
       setChannelName('')
       setChannelType('text')
       setShowChannelModal(false)
-    } catch {
-      setError('Não foi possível criar o canal.')
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err)
+      if (msg.includes('ALREADY_EXISTS')) {
+        setError('Já existe um canal com esse nome neste servidor.')
+      } else if (msg.includes('INVALID')) {
+        setError('Nome do canal inválido.')
+      } else {
+        setError('Não foi possível criar o canal.')
+      }
     } finally {
       setBusy(false)
     }
@@ -993,7 +1101,7 @@ export default function App(): React.JSX.Element {
         <section className="discord-shell">
           {/* Trilho de Servidores (Esquerda) */}
           <nav className="server-rail" aria-label="Servidores">
-            {/* Botão Home / Amigos com a Logo content.png */}
+            {/* Botão Home / Amigos com Emblema Masquerada SVG */}
             <div className={`rail-item-wrap ${currentView === 'friends' || currentView === 'dm' ? 'active' : ''}`}>
               <span className="rail-indicator" />
               <button
@@ -1005,7 +1113,7 @@ export default function App(): React.JSX.Element {
                   setActiveDmFriendId(undefined)
                 }}
               >
-                <img src="/logo.png" alt="Masquerada" className="rail-logo-img" />
+                <IconMasqueradaLogo />
               </button>
             </div>
 
@@ -1120,7 +1228,7 @@ export default function App(): React.JSX.Element {
               <VoiceBar
                 callState={callState}
                 participant={callParticipant}
-                channelName={activeVoiceChannel?.name}
+                channelName={activeVoiceChannel ? formatChannelDisplayName(activeVoiceChannel.name, 'voice') : undefined}
                 isMuted={isMuted}
                 isDeafened={isDeafened}
                 isLocalSpeaking={isLocalSpeaking}
@@ -1251,6 +1359,8 @@ export default function App(): React.JSX.Element {
                         onClick={() => {
                           setShowServerDropdown(false)
                           setChannelType('text')
+                          setChannelName('')
+                          setError(undefined)
                           setShowChannelModal(true)
                         }}
                       >
@@ -1332,6 +1442,8 @@ export default function App(): React.JSX.Element {
                     className="btn-icon-xs"
                     onClick={() => {
                       setChannelType('text')
+                      setChannelName('')
+                      setError(undefined)
                       setShowChannelModal(true)
                     }}
                     aria-label="Criar canal de texto"
@@ -1370,6 +1482,8 @@ export default function App(): React.JSX.Element {
                     className="btn-icon-xs"
                     onClick={() => {
                       setChannelType('voice')
+                      setChannelName('')
+                      setError(undefined)
                       setShowChannelModal(true)
                     }}
                     aria-label="Criar canal de voz"
@@ -1394,7 +1508,7 @@ export default function App(): React.JSX.Element {
                             <span className={`channel-voice-icon ${isVoiceConnected ? 'live' : ''}`}>
                               <IconSpeaker />
                             </span>
-                            <span className="channel-name">{channel.name}</span>
+                            <span className="channel-name">{formatChannelDisplayName(channel.name, 'voice')}</span>
                             {isVoiceConnected && (
                               <span className="voice-status-pill">
                                 <i /> RTC
@@ -1442,7 +1556,7 @@ export default function App(): React.JSX.Element {
               <VoiceBar
                 callState={callState}
                 participant={callParticipant}
-                channelName={activeVoiceChannel?.name}
+                channelName={activeVoiceChannel ? formatChannelDisplayName(activeVoiceChannel.name, 'voice') : undefined}
                 isMuted={isMuted}
                 isDeafened={isDeafened}
                 isLocalSpeaking={isLocalSpeaking}
@@ -1501,7 +1615,7 @@ export default function App(): React.JSX.Element {
             <VoiceStage
               callState={callState}
               participant={callParticipant}
-              channelName={activeVoiceChannel?.name}
+              channelName={activeVoiceChannel ? formatChannelDisplayName(activeVoiceChannel.name, 'voice') : undefined}
               isMuted={isMuted}
               isDeafened={isDeafened}
               isLocalSpeaking={isLocalSpeaking}
@@ -2138,6 +2252,22 @@ export default function App(): React.JSX.Element {
                 />
               </div>
             </div>
+
+            {error && (
+              <div
+                style={{
+                  color: '#f87171',
+                  background: 'rgba(239, 68, 68, 0.12)',
+                  border: '1px solid rgba(239, 68, 68, 0.3)',
+                  padding: '8px 12px',
+                  borderRadius: '6px',
+                  fontSize: '0.85rem',
+                  marginBottom: '16px'
+                }}
+              >
+                {error}
+              </div>
+            )}
 
             <div className="modal-actions">
               <button

@@ -60,15 +60,38 @@ function registerIpc(): void {
       throw new Error('INVALID_SERVER_NAME')
     }
     const server = await createLocalServer(displayName)
+    try {
+      await createLocalServerChannel(server.localStorageId, 'geral')
+      await createLocalServerChannel(server.localStorageId, 'voz-geral')
+    } catch {
+      // Ignora caso canais iniciais já existam
+    }
     return { localStorageId: server.localStorageId, serverId: server.serverId, displayName: server.displayName }
   })
   ipcMain.handle('channel:list', async (_event, storageId: unknown) => {
     if (typeof storageId !== 'string') throw new Error('INVALID_STORAGE_ID')
-    return listLocalServerChannels(storageId)
+    const channels = await listLocalServerChannels(storageId)
+    return channels.map((channel: { channelId: string; name: string; createdAt: number; createdBy: string; archived: boolean }) => ({
+      channelId: channel.channelId,
+      name: channel.name,
+      createdAt: channel.createdAt,
+      createdBy: channel.createdBy,
+      archived: channel.archived,
+      type: channel.name.startsWith('voz-') ? ('voice' as const) : ('text' as const)
+    }))
   })
-  ipcMain.handle('channel:create', async (_event, storageId: unknown, name: unknown) => {
+  ipcMain.handle('channel:create', async (_event, storageId: unknown, name: unknown, type?: unknown) => {
     if (typeof storageId !== 'string' || typeof name !== 'string') throw new Error('INVALID_ARGUMENT')
-    return createLocalServerChannel(storageId, name)
+    const finalName = type === 'voice' && !name.startsWith('voz-') ? `voz-${name}` : name
+    const created = await createLocalServerChannel(storageId, finalName)
+    return {
+      channelId: created.channelId,
+      name: created.name,
+      createdAt: created.createdAt,
+      createdBy: created.createdBy,
+      archived: created.archived,
+      type: (type === 'voice' || created.name.startsWith('voz-')) ? ('voice' as const) : ('text' as const)
+    }
   })
   ipcMain.handle('message:list', async (_event, storageId: unknown, channelId: unknown) => {
     if (typeof storageId !== 'string' || typeof channelId !== 'string') throw new Error('INVALID_ARGUMENT')

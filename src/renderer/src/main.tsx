@@ -22,8 +22,8 @@ if (typeof window !== 'undefined' && !window.masquerada) {
     { channelId: 'chan-geral', name: 'geral', archived: false, type: 'text' },
     { channelId: 'chan-dev', name: 'desenvolvimento', archived: false, type: 'text' },
     { channelId: 'chan-p2p', name: 'rede-p2p', archived: false, type: 'text' },
-    { channelId: 'chan-voice-geral', name: 'Geral de Voz', archived: false, type: 'voice' },
-    { channelId: 'chan-voice-reuniao', name: 'Reunião P2P', archived: false, type: 'voice' }
+    { channelId: 'chan-voice-geral', name: 'voz-geral', archived: false, type: 'voice' },
+    { channelId: 'chan-voice-reuniao', name: 'voz-reuniao', archived: false, type: 'voice' }
   ]
 
   // Histórico de mensagens isolado estritamente por canal
@@ -64,7 +64,8 @@ if (typeof window !== 'undefined' && !window.masquerada) {
     },
     listChannels: async () => [...mockChannels],
     createChannel: async (_id: string, name: string, type: 'text' | 'voice' = 'text') => {
-      const created = { channelId: `chan-${Date.now()}`, name, archived: false, type }
+      const finalName = type === 'voice' && !name.startsWith('voz-') ? `voz-${name}` : name
+      const created = { channelId: `chan-${Date.now()}`, name: finalName, archived: false, type }
       mockChannels.push(created)
       if (type === 'text') {
         mockMessagesByChannel[created.channelId] = []
