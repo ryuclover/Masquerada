@@ -18,6 +18,11 @@ export interface MasqueradaApi {
   listInvites(localStorageId: string): Promise<readonly unknown[]>
   createInvite(localStorageId: string, maxUses: number): Promise<{ encoded: string }>
   getDesktopSources?(options?: { types?: ('window' | 'screen')[]; thumbnailSize?: { width: number; height: number } }): Promise<readonly DesktopSource[]>
+  minimizeWindow?(): Promise<void>
+  toggleMaximizeWindow?(): Promise<boolean>
+  isWindowMaximized?(): Promise<boolean>
+  closeWindow?(): Promise<void>
+  onMaximizeChanged?(callback: (isMaximized: boolean) => void): () => void
 }
 
 const api: MasqueradaApi = {
@@ -30,7 +35,18 @@ const api: MasqueradaApi = {
   listMembers: (localStorageId) => ipcRenderer.invoke('member:list', localStorageId),
   listInvites: (localStorageId) => ipcRenderer.invoke('invite:list', localStorageId),
   createInvite: (localStorageId, maxUses) => ipcRenderer.invoke('invite:create', localStorageId, maxUses),
-  getDesktopSources: (options) => ipcRenderer.invoke('desktop:sources', options)
+  getDesktopSources: (options) => ipcRenderer.invoke('desktop:sources', options),
+  minimizeWindow: () => ipcRenderer.invoke('window:minimize'),
+  toggleMaximizeWindow: () => ipcRenderer.invoke('window:toggle-maximize'),
+  isWindowMaximized: () => ipcRenderer.invoke('window:is-maximized'),
+  closeWindow: () => ipcRenderer.invoke('window:close'),
+  onMaximizeChanged: (callback) => {
+    const handler = (_: unknown, val: boolean) => callback(val)
+    ipcRenderer.on('window:maximize-changed', handler)
+    return () => {
+      ipcRenderer.removeListener('window:maximize-changed', handler)
+    }
+  }
 }
 
 contextBridge.exposeInMainWorld('masquerada', api)

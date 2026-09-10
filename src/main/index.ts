@@ -1,4 +1,4 @@
-import { app, BrowserWindow, desktopCapturer, dialog, ipcMain, safeStorage } from 'electron'
+import { app, BrowserWindow, desktopCapturer, dialog, ipcMain, Menu, safeStorage } from 'electron'
 import { appendFileSync } from 'node:fs'
 import { join } from 'node:path'
 
@@ -32,6 +32,14 @@ function logStartup(msg: string): void {
 function createWindow(): BrowserWindow {
   const window = new BrowserWindow(createMainWindowOptions())
   mainWindow = window
+  window.setMenuBarVisibility(false)
+
+  window.on('maximize', () => {
+    window.webContents.send('window:maximize-changed', true)
+  })
+  window.on('unmaximize', () => {
+    window.webContents.send('window:maximize-changed', false)
+  })
 
   window.once('ready-to-show', () => {
     window.show()
@@ -132,6 +140,25 @@ function registerIpc(): void {
       appIcon: s.appIcon ? s.appIcon.toDataURL() : null
     }))
   })
+  ipcMain.handle('window:minimize', () => {
+    if (mainWindow) mainWindow.minimize()
+  })
+  ipcMain.handle('window:toggle-maximize', () => {
+    if (!mainWindow) return false
+    if (mainWindow.isMaximized()) {
+      mainWindow.unmaximize()
+      return false
+    } else {
+      mainWindow.maximize()
+      return true
+    }
+  })
+  ipcMain.handle('window:is-maximized', () => {
+    return mainWindow ? mainWindow.isMaximized() : false
+  })
+  ipcMain.handle('window:close', () => {
+    if (mainWindow) mainWindow.close()
+  })
 }
 
 logStartup(`Inicializando processo Masquerada (PID: ${process.pid}, exec: ${process.execPath})`)
@@ -151,6 +178,7 @@ if (!hasSingleInstanceLock) {
   })
 
   app.whenReady().then(async () => {
+    Menu.setApplicationMenu(null)
     logStartup(`App ready recebido. Carregando identidade em: ${join(app.getPath('userData'), 'identity')}`)
     const deviceIdentity = await loadOrCreateDeviceIdentity(
       join(app.getPath('userData'), 'identity'),

@@ -53,6 +53,11 @@ declare global {
       listDirectMessages?(friendId: string): Promise<readonly DirectMessage[]>
       sendDirectMessage?(friendId: string, content: string): Promise<unknown>
       getDesktopSources?(options?: { types?: ('window' | 'screen')[]; thumbnailSize?: { width: number; height: number } }): Promise<readonly { id: string; name: string; thumbnail: string; appIcon?: string | null }[]>
+      minimizeWindow?(): Promise<void>
+      toggleMaximizeWindow?(): Promise<boolean>
+      isWindowMaximized?(): Promise<boolean>
+      closeWindow?(): Promise<void>
+      onMaximizeChanged?(callback: (isMaximized: boolean) => void): () => void
     }
   }
 }
@@ -207,6 +212,55 @@ function formatChannelDisplayName(name: string, type?: 'text' | 'voice'): string
     return clean.replace(/\b\w/g, (char) => char.toUpperCase())
   }
   return name
+}
+
+function IconWindowMinimize(): React.JSX.Element {
+  return (
+    <svg width="10" height="10" viewBox="0 0 10 10">
+      <line x1="0" y1="5" x2="10" y2="5" stroke="currentColor" strokeWidth="1.2" />
+    </svg>
+  )
+}
+
+function IconWindowMaximize(): React.JSX.Element {
+  return (
+    <svg width="10" height="10" viewBox="0 0 10 10" fill="none">
+      <rect x="0.6" y="0.6" width="8.8" height="8.8" stroke="currentColor" strokeWidth="1.2" rx="1" />
+    </svg>
+  )
+}
+
+function IconWindowRestore(): React.JSX.Element {
+  return (
+    <svg width="10" height="10" viewBox="0 0 10 10" fill="none">
+      <rect x="2.5" y="0.6" width="6.9" height="6.9" stroke="currentColor" strokeWidth="1" rx="0.5" />
+      <rect x="0.6" y="2.5" width="6.9" height="6.9" fill="#09080e" stroke="currentColor" strokeWidth="1" rx="0.5" />
+    </svg>
+  )
+}
+
+function IconWindowClose(): React.JSX.Element {
+  return (
+    <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round">
+      <line x1="1" y1="1" x2="9" y2="9" />
+      <line x1="9" y1="1" x2="1" y2="9" />
+    </svg>
+  )
+}
+
+function IconMasqueradaMiniLogo(): React.JSX.Element {
+  return (
+    <svg width="15" height="15" viewBox="0 0 48 48" fill="none" aria-hidden="true">
+      <path
+        d="M24 6C15 6 6 12 4 19C2 26 5 33 11 38C17 43 22 45 24 45C26 45 31 43 37 38C43 33 46 26 44 19C42 12 33 6 24 6Z"
+        fill="#F59E0B"
+      />
+      <path
+        d="M11 22C14 20 18 20 20 24C18 27 14 27 11 25C9.5 24 9.5 23 11 22ZM37 22C34 20 30 20 28 24C30 27 34 27 37 25C38.5 24 38.5 23 37 22Z"
+        fill="#09080e"
+      />
+    </svg>
+  )
 }
 
 function IconSparkles(): React.JSX.Element {
@@ -419,6 +473,9 @@ export default function App(): React.JSX.Element {
   const [loadingMessages, setLoadingMessages] = useState(false)
   const [error, setError] = useState<string>()
 
+  // Estado da Janela (Controles Customizados Frameless)
+  const [isWindowMaximized, setIsWindowMaximized] = useState(false)
+
   // Perfil do Usuário (Estilo Discord) com persistência LocalStorage
   const [userProfile, setUserProfile] = useState<UserProfile>(() => {
     if (typeof window !== 'undefined') {
@@ -549,6 +606,31 @@ export default function App(): React.JSX.Element {
       }
     })
   }, [])
+
+  // Sincronizar estado de maximização da janela
+  useEffect(() => {
+    if (api?.isWindowMaximized) {
+      void api.isWindowMaximized().then(setIsWindowMaximized)
+    }
+    if (api?.onMaximizeChanged) {
+      const unsub = api.onMaximizeChanged(setIsWindowMaximized)
+      return unsub
+    }
+  }, [api])
+
+  const handleMinimizeWindow = useCallback(() => {
+    void api?.minimizeWindow?.()
+  }, [api])
+
+  const handleToggleMaximizeWindow = useCallback(() => {
+    void api?.toggleMaximizeWindow?.().then((max: boolean | undefined) => {
+      if (typeof max === 'boolean') setIsWindowMaximized(max)
+    })
+  }, [api])
+
+  const handleCloseWindow = useCallback(() => {
+    void api?.closeWindow?.()
+  }, [api])
 
   // Carregar lista de servidores
   useEffect(() => {
@@ -1046,11 +1128,52 @@ export default function App(): React.JSX.Element {
 
   return (
     <main className="app-shell">
+      {/* Barra de Título Customizada (Estilo Discord Frameless) */}
+      <div className="custom-titlebar">
+        <div className="titlebar-drag-region" onDoubleClick={handleToggleMaximizeWindow}>
+          <div className="titlebar-brand">
+            <IconMasqueradaMiniLogo />
+            <span className="titlebar-title">Masquerada — Comunicação Privada P2P</span>
+          </div>
+        </div>
+        <div className="titlebar-controls">
+          <button
+            type="button"
+            className="titlebar-btn minimize"
+            onClick={handleMinimizeWindow}
+            title="Minimizar"
+            aria-label="Minimizar janela"
+          >
+            <IconWindowMinimize />
+          </button>
+          <button
+            type="button"
+            className="titlebar-btn maximize"
+            onClick={handleToggleMaximizeWindow}
+            title={isWindowMaximized ? 'Restaurar' : 'Maximizar'}
+            aria-label={isWindowMaximized ? 'Restaurar janela' : 'Maximizar janela'}
+          >
+            {isWindowMaximized ? <IconWindowRestore /> : <IconWindowMaximize />}
+          </button>
+          <button
+            type="button"
+            className="titlebar-btn close"
+            onClick={handleCloseWindow}
+            title="Fechar"
+            aria-label="Fechar janela"
+          >
+            <IconWindowClose />
+          </button>
+        </div>
+      </div>
+
       {/* Tela de Onboarding (quando não há servidor criado) */}
       {!server ? (
         <section className="onboarding-wrap">
           <div className="onboarding">
-            <img src="/logo.png" alt="Masquerada Medallion" className="onboarding-logo-hero" />
+            <div className="onboarding-logo-hero" style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', background: 'rgba(245, 158, 11, 0.08)' }}>
+              <IconMasqueradaLogo />
+            </div>
             <span className="eyebrow">
               <IconSparkles /> ESPAÇO LOCAL-FIRST
             </span>

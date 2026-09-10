@@ -3,12 +3,15 @@ import type { BrowserWindowConstructorOptions } from 'electron'
 
 export function createMainWindowOptions(): BrowserWindowConstructorOptions {
   return {
-    width: 1000,
-    height: 700,
-    minWidth: 640,
-    minHeight: 480,
+    width: 1200,
+    height: 780,
+    minWidth: 800,
+    minHeight: 520,
     show: false,
-    backgroundColor: '#111827',
+    frame: false,
+    titleBarStyle: 'hidden',
+    autoHideMenuBar: true,
+    backgroundColor: '#0d0b12',
     webPreferences: {
       contextIsolation: true,
       nodeIntegration: false,

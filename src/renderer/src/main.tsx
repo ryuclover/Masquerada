@@ -123,7 +123,12 @@ if (typeof window !== 'undefined' && !window.masquerada) {
         time
       })
       return {}
-    }
+    },
+    minimizeWindow: async () => {},
+    toggleMaximizeWindow: async () => false,
+    isWindowMaximized: async () => false,
+    closeWindow: async () => {},
+    onMaximizeChanged: () => () => {}
   }
 }
 
