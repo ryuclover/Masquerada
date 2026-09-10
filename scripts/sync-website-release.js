@@ -14,8 +14,6 @@ const packageJsonPath = path.join(rootDir, 'package.json')
 const distExePath = path.join(rootDir, 'dist', 'Masquerada-Portable.exe')
 const websiteDir = path.join(rootDir, 'website')
 const websiteDownloadsDir = path.join(websiteDir, 'downloads')
-const websitePublicDir = path.join(websiteDir, 'public')
-const websitePublicDownloadsDir = path.join(websitePublicDir, 'downloads')
 const contentLogoPath = path.join(rootDir, 'content.png')
 
 // 1. Carregar versão do package.json
@@ -28,7 +26,7 @@ const packageData = JSON.parse(fs.readFileSync(packageJsonPath, 'utf-8'))
 const version = packageData.version || '0.1.0'
 
 // 2. Garantir diretórios
-const dirsToCreate = [websiteDir, websiteDownloadsDir, websitePublicDir, websitePublicDownloadsDir]
+const dirsToCreate = [websiteDir, websiteDownloadsDir]
 for (const dir of dirsToCreate) {
   if (!fs.existsSync(dir)) {
     fs.mkdirSync(dir, { recursive: true })
@@ -38,7 +36,6 @@ for (const dir of dirsToCreate) {
 // 3. Copiar logo
 if (fs.existsSync(contentLogoPath)) {
   fs.copyFileSync(contentLogoPath, path.join(websiteDir, 'logo.png'))
-  fs.copyFileSync(contentLogoPath, path.join(websitePublicDir, 'logo.png'))
 }
 
 // 4. Copiar e inspecionar executável
@@ -48,12 +45,10 @@ let sha256 = ''
 const fileName = 'Masquerada-Portable.exe'
 
 if (fs.existsSync(distExePath)) {
-  console.log(`[1/3] Copiando executável de dist/ para website/downloads/ e website/public/downloads/...`)
+  console.log(`[1/3] Copiando executável de dist/ para website/downloads/...`)
   const target1 = path.join(websiteDownloadsDir, fileName)
-  const target2 = path.join(websitePublicDownloadsDir, fileName)
   
   fs.copyFileSync(distExePath, target1)
-  fs.copyFileSync(distExePath, target2)
 
   const stats = fs.statSync(target1)
   fileSizeBytes = stats.size
@@ -94,7 +89,6 @@ const versionPayload = {
 
 const payloadStr = JSON.stringify(versionPayload, null, 2)
 fs.writeFileSync(path.join(websiteDir, 'version.json'), payloadStr, 'utf-8')
-fs.writeFileSync(path.join(websitePublicDir, 'version.json'), payloadStr, 'utf-8')
 
-console.log(`[3/3] Manifestos version.json atualizados com sucesso! (Versão: v${version}, Tamanho: ${fileSizeFormatted})`)
+console.log(`[3/3] Manifesto version.json atualizado com sucesso! (Versão: v${version}, Tamanho: ${fileSizeFormatted})`)
 console.log(`Pronto para deploy na Vercel com 'npx vercel --prod website'.`)
