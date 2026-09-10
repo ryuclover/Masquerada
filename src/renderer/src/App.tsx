@@ -30,6 +30,7 @@ export default function App(): React.JSX.Element {
   const [inviteCode, setInviteCode] = useState('')
   const [panel, setPanel] = useState<'members' | 'invites'>('members')
   const [busy, setBusy] = useState(false)
+  const [loadingMessages, setLoadingMessages] = useState(false)
   const [error, setError] = useState<string>()
   const api = typeof window === 'undefined' ? undefined : window.masquerada
 
@@ -53,7 +54,8 @@ export default function App(): React.JSX.Element {
 
   useEffect(() => {
     if (!server || !selectedChannel || !api) return
-    void api.listMessages(server.localStorageId, selectedChannel).then(setMessages).catch(() => setError('Não foi possível carregar o histórico.'))
+    setLoadingMessages(true)
+    void api.listMessages(server.localStorageId, selectedChannel).then(setMessages).catch(() => setError('Não foi possível carregar o histórico.')).finally(() => setLoadingMessages(false))
   }, [api, selectedChannel, server])
 
   async function createServer(): Promise<void> {
@@ -83,7 +85,7 @@ export default function App(): React.JSX.Element {
 
   return (
     <main className="app-shell">
-      <header className="topbar"><strong>MASQUERADA</strong><span>{server ? server.displayName : 'Offline local'}</span></header>
+      <header className="topbar"><div className="brand-mark"><span className="brand-glyph">M</span><strong>MASQUERADA</strong></div><span className="privacy-pill"><i /> privado neste dispositivo</span></header>
       {!server ? (
         <section className="onboarding panel">
           <p className="eyebrow">PRIVATE / LOCAL-FIRST</p>
@@ -93,20 +95,25 @@ export default function App(): React.JSX.Element {
           <button disabled={busy || !serverName.trim()} onClick={() => void createServer()}>{busy ? 'Criando...' : 'Criar servidor'}</button>
         </section>
       ) : (
-        <section className="workspace">
-          <aside className="sidebar panel" aria-label="Navegação do servidor">
-            <div className="server-switcher">{servers.map((item) => <button key={item.localStorageId} className={item.localStorageId === server.localStorageId ? 'server-chip active' : 'server-chip'} onClick={() => setServer(item)} title={item.displayName}>{item.displayName.slice(0, 1).toUpperCase()}</button>)}<button className="server-chip add" onClick={() => setServer(undefined)} aria-label="Criar outro servidor">+</button></div>
-            <div className="section-heading"><span>Canais</span><button className="icon-button" onClick={() => void createChannel()}>+</button></div>
-            {channels.map((channel) => <button className={channel.channelId === selectedChannel ? 'channel selected' : 'channel'} key={channel.channelId} onClick={() => setSelectedChannel(channel.channelId)}># {channel.name}</button>)}
-            <input className="compact-input" value={channelName} onChange={(event) => setChannelName(event.target.value)} placeholder="novo canal" aria-label="Nome do novo canal" />
-            <div className="sidebar-tools"><button className={panel === 'members' ? 'tool active' : 'tool'} onClick={() => setPanel('members')}>Membros <span>{members.length}</span></button><button className={panel === 'invites' ? 'tool active' : 'tool'} onClick={() => setPanel('invites')}>Convites <span>{invites.length}</span></button></div>
-            {panel === 'members' ? <div className="people-list">{members.map((member) => <div className="person" key={member.deviceFingerprint}><span className="avatar small">M</span><span title={member.deviceFingerprint}>membro<br /><small>{member.deviceFingerprint.slice(0, 18)}...</small></span></div>)}</div> : <div className="invite-panel"><button onClick={() => void generateInvite()}>Gerar convite</button>{inviteCode && <textarea readOnly value={inviteCode} aria-label="Convite gerado" />}{invites.map((invite) => <small key={invite.inviteId}>{invite.status} · {invite.uses}/{invite.maxUses}</small>)}</div>}
+        <section className="discord-shell">
+          <nav className="server-rail" aria-label="Servidores">
+            <button className="rail-logo" aria-label="Masquerada home">M</button><span className="rail-divider" />
+            {servers.map((item) => <button key={item.localStorageId} className={item.localStorageId === server.localStorageId ? 'rail-server active' : 'rail-server'} onClick={() => setServer(item)} title={item.displayName}>{item.displayName.slice(0, 1).toUpperCase()}</button>)}
+            <button className="rail-server add" onClick={() => setServer(undefined)} aria-label="Criar servidor">+</button>
+          </nav>
+          <aside className="server-sidebar" aria-label="Navegação do servidor">
+            <button className="server-title"><span>{server.displayName}</span><b>⌄</b></button>
+            <div className="server-subtitle"><span>seu espaço privado</span><span className="online-dot" /> </div>
+            <div className="channel-heading"><span>CANAIS DE TEXTO</span><button onClick={() => void createChannel()} aria-label="Criar canal">＋</button></div>
+            <div className="channel-list">{channels.length ? channels.map((channel) => <button className={channel.channelId === selectedChannel ? 'channel selected' : 'channel'} key={channel.channelId} onClick={() => setSelectedChannel(channel.channelId)}><span className="hash">#</span>{channel.name}</button>) : <p className="sidebar-empty">Nenhum canal ainda.</p>}</div>
+            <div className="new-channel"><input value={channelName} onChange={(event) => setChannelName(event.target.value)} placeholder="nome do canal" aria-label="Nome do novo canal" /><button onClick={() => void createChannel()} aria-label="Confirmar novo canal">＋</button></div>
+            <div className="sidebar-bottom"><div className="profile-card"><span className="avatar profile-avatar">M<span className="status-dot" /></span><span><strong>Você</strong><small>identidade local</small></span><button aria-label="Configurações">⚙</button></div></div>
           </aside>
-          <section className="conversation panel">
-            <div className="conversation-header"><div><p className="eyebrow">CHANNEL</p><h2>{channels.find((channel) => channel.channelId === selectedChannel)?.name ?? 'Selecione um canal'}</h2></div><span className="connection-dot">● conectado</span></div>
-            <div className="timeline">{messages.map((message) => <article className={message.deletedAt ? 'message deleted' : 'message'} key={message.sequence}><span className="avatar">M</span><div><div className="message-meta">membro <small>#{message.sequence}</small></div><p>{message.deletedAt ? 'Mensagem removida' : message.content}</p></div></article>)}</div>
+          <section className="conversation">
+            <header className="conversation-header"><div className="channel-label"><span className="big-hash">#</span><div><h2>{channels.find((channel) => channel.channelId === selectedChannel)?.name ?? 'Selecione um canal'}</h2><p>Conversas privadas, armazenadas localmente</p></div></div><div className="conversation-actions"><button aria-label="Buscar">⌕</button><button className={panel === 'members' ? 'action active' : 'action'} onClick={() => setPanel('members')} aria-label="Mostrar membros">♟ <span>{members.length}</span></button><button className={panel === 'invites' ? 'action active' : 'action'} onClick={() => setPanel('invites')} aria-label="Mostrar convites">♧</button></div></header>
+            <div className="conversation-body"><div className="timeline">{loadingMessages ? <div className="loading-state" role="status"><span className="loading-spinner" />Abrindo histórico...</div> : messages.length === 0 ? <div className="empty-chat"><span className="empty-symbol">✦</span><h3>O começo de uma conversa</h3><p>Este é o início do canal. Escreva algo para abrir a roda.</p></div> : messages.map((message) => <article className={message.deletedAt ? 'message deleted' : 'message'} key={message.sequence}><span className="avatar">M</span><div><div className="message-meta"><strong>membro</strong><small>hoje às 14:{String(message.sequence).padStart(2, '0')}</small></div><p>{message.deletedAt ? 'Mensagem removida' : message.content}</p></div></article>)}</div>{panel && <aside className="member-panel" aria-label={panel === 'members' ? 'Membros' : 'Convites'}><div className="member-panel-head"><strong>{panel === 'members' ? 'Membros' : 'Convites'}</strong><button onClick={() => setPanel('members')} aria-label="Fechar painel">×</button></div>{panel === 'members' ? <div className="people-list">{members.length ? members.map((member) => <div className="person" key={member.deviceFingerprint}><span className="avatar small">M</span><span title={member.deviceFingerprint}>membro<br /><small>{member.deviceFingerprint.slice(0, 18)}...</small></span></div>) : <p className="sidebar-empty">Nenhum membro conectado.</p>}</div> : <div className="invite-panel"><p>Convide alguém para este espaço.</p><button onClick={() => void generateInvite()}>Gerar convite</button>{inviteCode && <textarea readOnly value={inviteCode} aria-label="Convite gerado" />}{invites.map((invite) => <small key={invite.inviteId}>{invite.status} · {invite.uses}/{invite.maxUses}</small>)}</div>}</aside>}</div>
             {error && <div className="error-banner" role="alert">{error}<button onClick={() => setError(undefined)} aria-label="Fechar aviso">×</button></div>}
-            <div className="composer"><textarea disabled={busy} value={draft} onChange={(event) => setDraft(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); void sendMessage() } }} placeholder="Escreva uma mensagem..." aria-label="Mensagem" /><button disabled={busy || !draft.trim()} onClick={() => void sendMessage()}>{busy ? '...' : 'Enviar'}</button></div>
+            <div className="composer-wrap"><div className="composer"><button className="attach-button" aria-label="Adicionar anexo">＋</button><textarea disabled={busy} value={draft} onChange={(event) => setDraft(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); void sendMessage() } }} placeholder={`Conversar em #${channels.find((channel) => channel.channelId === selectedChannel)?.name ?? 'canal'}`} aria-label="Mensagem" /><button className="send-button" disabled={busy || !draft.trim()} onClick={() => void sendMessage()}>{busy ? '...' : '➤'}</button></div><small className="composer-hint">Enter para enviar · Shift + Enter para nova linha</small></div>
           </section>
         </section>
       )}
