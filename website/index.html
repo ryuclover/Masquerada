@@ -1,0 +1,306 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Masquerada — Comunicação Privada e Soberana P2P</title>
+  <meta name="description" content="Baixe o Masquerada para Windows: Aplicativo desktop local-first de comunicação P2P direta, voz de alta fidelidade com supressão de ruído calibrável e compartilhamento de tela em 60 FPS.">
+  <link rel="icon" type="image/png" href="logo.png">
+
+  <!-- Google Fonts: Outfit & JetBrains Mono -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Outfit:wght@300;400;500;600;700;800;900&display=swap" rel="stylesheet">
+
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <!-- Ambient background glow effects -->
+  <div class="bg-glow bg-glow-1"></div>
+  <div class="bg-glow bg-glow-2"></div>
+  <div class="bg-grid-overlay"></div>
+
+  <!-- Header / Navigation -->
+  <header class="site-header">
+    <div class="nav-container">
+      <a href="#" class="brand-link">
+        <div class="brand-logo-wrap">
+          <img src="logo.png" alt="Masquerada Logo" class="brand-logo">
+        </div>
+        <div class="brand-text">
+          <span class="brand-name">MASQUERADA</span>
+          <span class="brand-tag">P2P PROTOCOL</span>
+        </div>
+      </a>
+
+      <nav class="nav-links">
+        <a href="#recursos">Recursos</a>
+        <a href="#voz">Voz & Ruído</a>
+        <a href="#tela">Compartilhamento de Tela</a>
+        <a href="#requisitos">Requisitos</a>
+      </nav>
+
+      <div class="nav-actions">
+        <a href="#download" class="nav-download-btn">
+          <span>Baixar Agora</span>
+          <span class="nav-version-badge" id="navVersionBadge">v0.1.0</span>
+        </a>
+      </div>
+    </div>
+  </header>
+
+  <!-- Hero Section -->
+  <main>
+    <section class="hero-section" id="download">
+      <div class="hero-container">
+        <div class="hero-badge">
+          <span class="pulse-dot"></span>
+          <span>Versão Oficial Disponível para Windows</span>
+        </div>
+
+        <h1 class="hero-title">
+          Comunicação P2P Soberana.<br>
+          <span class="gradient-text">Zero Servidores Centrais.</span>
+        </h1>
+
+        <p class="hero-description">
+          Converse por voz com áudio cristalino <strong>Opus 48kHz</strong>, controle o ruído ambiente com um slider de 1% a 100% e compartilhe sua tela em <strong>60 FPS / 1080p</strong> com nitidez espacial para código e texto. 100% criptografado e sem intermediários.
+        </p>
+
+        <!-- Dynamic Download Card -->
+        <div class="download-card">
+          <div class="download-primary-row">
+            <a href="downloads/Masquerada-Portable.exe" class="btn-download" id="primaryDownloadBtn" download>
+              <div class="btn-download-icon">
+                <!-- Windows Icon -->
+                <svg width="28" height="28" viewBox="0 0 24 24" fill="currentColor">
+                  <path d="M0 3.449L9.75 2.1v9.451H0m10.949-9.602L24 0v11.4H10.949M0 12.6h9.75v9.451L0 20.699M10.949 12.6H24V24l-12.901-1.799"/>
+                </svg>
+              </div>
+              <div class="btn-download-text">
+                <span class="btn-download-title">Baixar para Windows</span>
+                <span class="btn-download-subtitle" id="downloadSubtitle">Carregando versão...</span>
+              </div>
+              <div class="btn-download-arrow">
+                <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                  <line x1="12" y1="5" x2="12" y2="19"></line>
+                  <polyline points="19 12 12 19 5 12"></polyline>
+                </svg>
+              </div>
+            </a>
+          </div>
+
+          <!-- Download Details & Safety Row -->
+          <div class="download-meta-row">
+            <div class="meta-item">
+              <span class="meta-label">Tipo:</span>
+              <span class="meta-value highlight">Executável Portátil (.exe)</span>
+            </div>
+            <div class="meta-separator">•</div>
+            <div class="meta-item">
+              <span class="meta-label">Instalação:</span>
+              <span class="meta-value">Não requer instalador nem admin</span>
+            </div>
+            <div class="meta-separator">•</div>
+            <div class="meta-item">
+              <span class="meta-label">Compatibilidade:</span>
+              <span class="meta-value">Windows 10 / 11 (64-bit)</span>
+            </div>
+            <div class="meta-separator">•</div>
+            <div class="meta-item">
+              <span class="meta-label">Tamanho:</span>
+              <span class="meta-value" id="fileSizeDisplay">~97.1 MB</span>
+            </div>
+          </div>
+
+          <!-- Post-click feedback banner -->
+          <div class="download-feedback-banner" id="downloadFeedbackBanner">
+            <div class="feedback-icon">🎉</div>
+            <div class="feedback-text">
+              <strong>Seu download começou automaticamente!</strong>
+              <p>Abra o arquivo <code>Masquerada-Portable.exe</code> baixado para iniciar instantaneamente sem nenhum assistente de instalação.</p>
+            </div>
+          </div>
+        </div>
+
+        <!-- Quick integrity hash info -->
+        <div class="security-checksum-bar">
+          <span class="hash-tag">SHA-256:</span>
+          <code class="hash-code" id="sha256Display">Calculando hash de verificação...</code>
+          <button class="btn-copy-hash" id="btnCopyHash" title="Copiar Checksum">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect>
+              <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path>
+            </svg>
+            <span id="copyFeedback">Copiar</span>
+          </button>
+        </div>
+      </div>
+    </section>
+
+    <!-- Visual Interactive Preview -->
+    <section class="preview-section">
+      <div class="preview-container">
+        <div class="preview-frame">
+          <div class="preview-topbar">
+            <div class="preview-dots">
+              <span class="dot dot-red"></span>
+              <span class="dot dot-yellow"></span>
+              <span class="dot dot-green"></span>
+            </div>
+            <div class="preview-title">Masquerada v<span class="preview-version-text">0.1.0</span> — Conexão Direta Criptografada</div>
+            <div class="preview-badge-status">● P2P ONLINE</div>
+          </div>
+
+          <div class="preview-mockup-content">
+            <div class="mockup-sidebar">
+              <div class="mockup-server-icon">
+                <img src="logo.png" alt="M" class="mini-logo">
+              </div>
+              <div class="mockup-channels">
+                <span class="mockup-cat">CANAIS DE VOZ</span>
+                <div class="mockup-channel active">🔊 Geral de Voz <span class="badge-rtc">RTC</span></div>
+                <div class="mockup-channel">🔊 Reunião P2P</div>
+                <span class="mockup-cat">CANAIS DE TEXTO</span>
+                <div class="mockup-channel"># geral</div>
+                <div class="mockup-channel"># desenvolvimento</div>
+              </div>
+            </div>
+
+            <div class="mockup-stage">
+              <div class="mockup-stage-header">
+                <h3>🔊 Geral de Voz</h3>
+                <span class="stage-pill">● RTC P2P Conectado (Opus 48kHz)</span>
+                <span class="stage-live-pill"><span class="live-blink"></span> AO VIVO</span>
+              </div>
+
+              <div class="mockup-cinema-video">
+                <div class="mockup-video-overlay">
+                  <div class="video-author">🖥️ Compartilhamento de Tela 1080p @ 60 FPS • Modo Código & Nitidez</div>
+                  <div class="video-tag">contentHint: detail</div>
+                </div>
+                <div class="mockup-code-lines">
+                  <code><span class="c-kw">const</span> peer = <span class="c-kw">new</span> <span class="c-fn">RTCPeerConnection</span>(p2pSecureConfig)</code>
+                  <code>peer.addTrack(screenVideoTrack, localMediaStream)</code>
+                  <code><span class="c-comment">// Zero intermediários: streaming ponta a ponta</span></code>
+                </div>
+              </div>
+
+              <div class="mockup-controls-dock">
+                <div class="mockup-btn">🎙️ Mutar</div>
+                <div class="mockup-btn">🎧 Silenciar</div>
+                <div class="mockup-btn active-share">🖥️ Tela</div>
+                <div class="mockup-btn hangup">📞 Sair</div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Key Features Section -->
+    <section class="features-section" id="recursos">
+      <div class="section-header">
+        <h2 class="section-title">Engenharia Local-First de Alto Desempenho</h2>
+        <p class="section-sub">Diga adeus à censura, quedas de servidores e vigilância em nuvem.</p>
+      </div>
+
+      <div class="features-grid">
+        <div class="feature-card">
+          <div class="feature-icon-wrap icon-purple">
+            <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+              <rect x="3" y="11" width="18" height="11" rx="2" ry="2"></rect>
+              <path d="M7 11V7a5 5 0 0 1 10 0v4"></path>
+            </svg>
+          </div>
+          <h3>Criptografia P2P Soberana</h3>
+          <p>Seus dados e chamadas viajam diretamente entre você e seus amigos via Ed25519 e SRTP. Não existe servidor central para interceptar ou gravar suas conversas.</p>
+        </div>
+
+        <div class="feature-card" id="voz">
+          <div class="feature-icon-wrap icon-emerald">
+            <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"></path>
+              <path d="M19 10v2a7 7 0 0 1-14 0v-2"></path>
+              <line x1="12" y1="19" x2="12" y2="23"></line>
+              <line x1="8" y1="23" x2="16" y2="23"></line>
+            </svg>
+          </div>
+          <h3>Supressão de Ruído de 1% a 100%</h3>
+          <p>Ajuste fino do Noise Gate com retorno em tempo real ("Ouvir o Microfone") e medidor VU dinâmico para eliminar cliques de teclado, ventiladores e barulhos de fundo.</p>
+        </div>
+
+        <div class="feature-card" id="tela">
+          <div class="feature-icon-wrap icon-cyan">
+            <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+              <rect x="2" y="3" width="20" height="14" rx="2" ry="2"></rect>
+              <line x1="8" y1="21" x2="16" y2="21"></line>
+              <line x1="12" y1="17" x2="12" y2="21"></line>
+            </svg>
+          </div>
+          <h3>Compartilhamento de Tela 60 FPS</h3>
+          <p>Otimização especial para leitura de código e terminais com preservação de resolução (sem texto borrado), além de modo fluído para vídeos e demonstrações.</p>
+        </div>
+
+        <div class="feature-card">
+          <div class="feature-icon-wrap icon-gold">
+            <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
+              <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"></polygon>
+            </svg>
+          </div>
+          <h3>100% Portátil e Sem Fricção</h3>
+          <p>O arquivo .exe abre instantaneamente com dois cliques. Não requer direitos de administrador, não instala serviços em segundo plano e não deixa lixo no sistema.</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- System Requirements Section -->
+    <section class="requirements-section" id="requisitos">
+      <div class="requirements-box">
+        <h3 class="req-title">Requisitos do Sistema</h3>
+        <div class="req-grid">
+          <div class="req-item">
+            <span class="req-label">Sistema Operacional</span>
+            <span class="req-val">Windows 10 / 11 (64-bit)</span>
+          </div>
+          <div class="req-item">
+            <span class="req-label">Memória RAM</span>
+            <span class="req-val">512 MB livre (Uso leve de CPU)</span>
+          </div>
+          <div class="req-item">
+            <span class="req-label">Espaço em Disco</span>
+            <span class="req-val">~200 MB</span>
+          </div>
+          <div class="req-item">
+            <span class="req-label">Periféricos</span>
+            <span class="req-val">Microfone & Fone de Ouvido</span>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <!-- Footer -->
+  <footer class="site-footer">
+    <div class="footer-container">
+      <div class="footer-brand">
+        <img src="logo.png" alt="Masquerada" class="footer-logo">
+        <div>
+          <span class="footer-name">MASQUERADA</span>
+          <p class="footer-desc">Protocolo de comunicação ponto a ponto soberana.</p>
+        </div>
+      </div>
+
+      <div class="footer-links">
+        <span>Versão Atual: <strong id="footerVersion">v0.1.0</strong></span>
+        <span class="footer-sep">•</span>
+        <a href="#download" class="footer-link">Baixar .EXE</a>
+        <span class="footer-sep">•</span>
+        <span>Licença MIT</span>
+      </div>
+    </div>
+  </footer>
+
+  <script src="app.js"></script>
+</body>
+</html>

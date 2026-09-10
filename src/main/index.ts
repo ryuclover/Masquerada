@@ -1,4 +1,4 @@
-import { app, BrowserWindow, ipcMain, safeStorage } from 'electron'
+import { app, BrowserWindow, desktopCapturer, ipcMain, safeStorage } from 'electron'
 import { join } from 'node:path'
 
 import {
@@ -76,6 +76,21 @@ function registerIpc(): void {
       throw new Error('INVALID_ARGUMENT')
     }
     return createInvite(storageId, maxUses)
+  })
+  ipcMain.handle('desktop:sources', async (_event, options?: { types?: ('window' | 'screen')[]; thumbnailSize?: { width: number; height: number } }) => {
+    const types = options?.types || ['screen', 'window']
+    const thumbnailSize = options?.thumbnailSize || { width: 320, height: 180 }
+    const sources = await desktopCapturer.getSources({
+      types,
+      thumbnailSize,
+      fetchWindowIcons: true
+    })
+    return sources.map((s) => ({
+      id: s.id,
+      name: s.name,
+      thumbnail: s.thumbnail.toDataURL(),
+      appIcon: s.appIcon ? s.appIcon.toDataURL() : null
+    }))
   })
 }
 

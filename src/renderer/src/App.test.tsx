@@ -7,7 +7,7 @@ describe('App', () => {
   it('exibe o onboarding local-first', () => {
     const html = renderToStaticMarkup(<App />)
 
-    expect(html).toContain('MASQUERADA')
+    expect(html).toContain('Masquerada')
     expect(html).toContain('Criar servidor')
     expect(html).toContain('Converse sem abrir mão do controle.')
   })

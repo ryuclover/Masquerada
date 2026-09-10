@@ -1,6 +1,10 @@
 node_modules/
 out/
+dist/
 coverage/
 *.log
 electron.vite.config.*.mjs
 .DS_Store
+website/downloads/*.exe
+website/public/downloads/*.exe
+

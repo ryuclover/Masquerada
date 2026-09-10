@@ -1,0 +1,32 @@
+appId: com.masquerada.app
+productName: Masquerada
+executableName: Masquerada
+copyright: Copyright © 2026 Masquerada
+
+directories:
+  output: dist
+
+files:
+  - out/**/*
+  - package.json
+
+win:
+  target:
+    - target: portable
+      arch:
+        - x64
+    - target: nsis
+      arch:
+        - x64
+  icon: content.png
+
+portable:
+  artifactName: ${productName}-Portable.${ext}
+
+nsis:
+  oneClick: true
+  perMachine: false
+  createDesktopShortcut: always
+  createStartMenuShortcut: true
+  shortcutName: Masquerada
+  artifactName: ${productName}-Instalador.${ext}
