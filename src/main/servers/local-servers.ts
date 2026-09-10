@@ -1,4 +1,5 @@
 import { app, safeStorage } from 'electron'
+import { randomUUID } from 'node:crypto'
 
 import type { DeviceIdentity } from '../security/device-identity'
 import {
@@ -14,6 +15,7 @@ import type {
 import type { CreateServerInviteOptions, ServerInvite } from './server-invite'
 
 let storage: ReturnType<typeof createLocalServerStorage> | undefined
+let deviceFingerprint: string | undefined
 
 export function initializeLocalServers(deviceIdentity: DeviceIdentity): void {
   if (storage) {
@@ -21,6 +23,7 @@ export function initializeLocalServers(deviceIdentity: DeviceIdentity): void {
   }
 
   storage = createLocalServerStorage(app.getPath('userData'), safeStorage, deviceIdentity)
+  deviceFingerprint = deviceIdentity.fingerprint
 }
 
 export async function createLocalServer(displayName: string): Promise<LocalServer> {
@@ -29,6 +32,35 @@ export async function createLocalServer(displayName: string): Promise<LocalServe
 
 export async function loadLocalServer(localStorageId: string): Promise<LocalServer> {
   return getStorage().loadLocalServer(localStorageId)
+}
+
+export async function listLocalServerChannels(localStorageId: string) {
+  return getStorage().listLocalServerChannels(localStorageId)
+}
+
+export async function createLocalServerChannel(localStorageId: string, name: string) {
+  return getStorage().createLocalServerChannel(localStorageId, {
+    name,
+    actorFingerprint: getDeviceFingerprint()
+  })
+}
+
+export async function listLocalServerMessages(localStorageId: string, channelId: string) {
+  return getStorage().listLocalServerMessages(localStorageId, { channelId, limit: 100 })
+}
+
+export async function sendLocalServerMessage(localStorageId: string, channelId: string, content: string) {
+  return getStorage().createLocalServerMessage(localStorageId, {
+    channelId,
+    content,
+    clientMessageId: randomUUID().replaceAll('-', ''),
+    actorFingerprint: getDeviceFingerprint()
+  })
+}
+
+function getDeviceFingerprint(): string {
+  if (!deviceFingerprint) throw new Error('A identidade do dispositivo não foi inicializada.')
+  return deviceFingerprint
 }
 
 export async function createLocalServerInvite(

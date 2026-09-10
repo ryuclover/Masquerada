@@ -27,6 +27,7 @@ import {
   deleteChannel,
   deleteMessage,
   editMessage,
+  getMessageByClientMessageId,
   listChannels,
   listMessages,
   renameChannel,
@@ -864,6 +865,45 @@ export function createLocalServerStorage(
 
       try {
         return Object.freeze(listMessages(db, options))
+      } finally {
+        db.close()
+      }
+    },
+
+    findLocalServerMessageByClientMessageId: async (
+      localStorageId: string,
+      options: { readonly channelId: string; readonly clientMessageId: string }
+    ): Promise<ServerMessage | undefined> => {
+      assertValidStorageId(localStorageId)
+      const rootRealPath = await inspectServersRoot(serversRoot)
+
+      if (!rootRealPath) {
+        throw new LocalServerStorageError('SERVER_NOT_FOUND')
+      }
+
+      const server = await loadLocalServerFromRoot(
+        serversRoot,
+        rootRealPath,
+        localStorageId,
+        secureStorage,
+        platform
+      )
+      const serverDirectory = deriveDirectChildPath(serversRoot, localStorageId)
+      const databasePath = deriveDirectChildPath(serverDirectory, DATABASE_FILE_NAME)
+      const db = openServerDatabase(
+        databasePath,
+        {
+          deviceFingerprint: server.initialOwner.deviceFingerprint,
+          publicKey: server.initialOwner.publicKey
+        },
+        {
+          serverId: server.serverId,
+          serverPublicKey: server.identity.publicKey
+        }
+      )
+
+      try {
+        return getMessageByClientMessageId(db, options.channelId, options.clientMessageId)
       } finally {
         db.close()
       }

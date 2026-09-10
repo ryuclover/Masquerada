@@ -1,5 +1,5 @@
 import { createHash, generateKeyPairSync } from 'node:crypto'
-import { mkdtempSync, readFileSync } from 'node:fs'
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { mkdtemp, readFile, rm, stat } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -13,6 +13,7 @@ import {
 } from '../security/authenticated-candidate'
 import {
   admitMemberWithInvite,
+  applyMessageRetention,
   createChannel,
   createMessage,
   createMessageOperationAuthorization,
@@ -39,6 +40,7 @@ import {
   revokeServerInvite,
   ServerDatabaseError,
   setChannelArchived,
+  snapshotServerDatabase,
   validateServerDatabaseFile,
   verifyPersistedMemberAuthorization
 } from './server-database'
@@ -1147,6 +1149,100 @@ describe('mensagens do servidor (ETAPA 8.3)', () => {
       fixture.db.close()
     }
   }, 30000)
+
+  it('retenção remove apenas lápides antigas em transação bounded (ETAPA 9.4)', () => {
+    const fixture = createMessageFixture()
+    try {
+      const now = 1_700_000_000
+      // Live message must survive every sweep regardless of age.
+      const live = createMessage(fixture.db, {
+        channelId: fixture.channel.channelId, content: 'viva',
+        clientMessageId: 'a'.repeat(32), authorization: fixture.ownerAuthorization, nowSeconds: now - 1000
+      })
+      const freshTomb = createMessage(fixture.db, {
+        channelId: fixture.channel.channelId, content: 'recente',
+        clientMessageId: 'c'.repeat(32), authorization: fixture.ownerAuthorization, nowSeconds: now
+      })
+      deleteMessage(fixture.db, {
+        messageId: freshTomb.messageId, authorization: fixture.ownerAuthorization, nowSeconds: now + 10
+      })
+      const old = createMessage(fixture.db, {
+        channelId: fixture.channel.channelId, content: 'velha',
+        clientMessageId: 'b'.repeat(32), authorization: fixture.ownerAuthorization, nowSeconds: now - 100
+      })
+      deleteMessage(fixture.db, { messageId: old.messageId, authorization: fixture.ownerAuthorization, nowSeconds: now - 50 })
+
+      const sweep = applyMessageRetention(fixture.db, { nowSeconds: now + 20, maxTombstoneAgeSeconds: 40 })
+      expect(sweep.removed).toBe(1)
+      expect(listMessages(fixture.db, { channelId: fixture.channel.channelId })).toHaveLength(2)
+      expect(listMessages(fixture.db, { channelId: fixture.channel.channelId }).some((message) => message.messageId === live.messageId)).toBe(true)
+
+      // A later sweep removes the now-old tombstone but still keeps the live message.
+      const sweepAgain = applyMessageRetention(fixture.db, { nowSeconds: now + 100, maxTombstoneAgeSeconds: 40 })
+      expect(sweepAgain.removed).toBe(1)
+      const survivors = listMessages(fixture.db, { channelId: fixture.channel.channelId })
+      expect(survivors).toHaveLength(1)
+      expect(survivors[0]!.messageId).toBe(live.messageId)
+    } finally {
+      fixture.db.close()
+    }
+  })
+
+  it('snapshot VACUUM INTO é consistente e carregável (ETAPA 9.2)', () => {
+    const fixture = createMessageFixture()
+    const snapshotPath = join(fixture.dbPath, '..', 'snapshot.db')
+    try {
+      createMessage(fixture.db, {
+        channelId: fixture.channel.channelId, content: 'antes do snapshot',
+        clientMessageId: 'c'.repeat(32), authorization: fixture.ownerAuthorization
+      })
+      snapshotServerDatabase(fixture.db, snapshotPath)
+
+      const snapshotDb = openServerDatabase(snapshotPath, {
+        deviceFingerprint: fixture.owner.fingerprint,
+        publicKey: fixture.owner.publicKey
+      })
+      try {
+        expect(snapshotDb.prepare('SELECT COUNT(*) AS count FROM messages;').get()).toMatchObject({ count: 1 })
+        expect(listMessages(snapshotDb, { channelId: fixture.channel.channelId })[0]!.content).toBe('antes do snapshot')
+      } finally {
+        snapshotDb.close()
+      }
+    } finally {
+      fixture.db.close()
+      rmSync(snapshotPath, { force: true })
+    }
+  })
+
+  it('transação interrompida sem commit é descartada na reabertura (crash recovery)', () => {
+    const fixture = createMessageFixture()
+    try {
+      // Simula crash: transação aberta com INSERT nunca commitado.
+      const crashed = new DatabaseSync(fixture.dbPath)
+      try {
+        crashed.exec('BEGIN IMMEDIATE;')
+        crashed.prepare('INSERT INTO invites VALUES (?, ?, 2000000000, 3, 0, 0);').run(
+          '9'.repeat(32), Buffer.alloc(32, 7)
+        )
+      } finally {
+        crashed.close()
+      }
+
+      const reopened = openServerDatabase(fixture.dbPath, {
+        deviceFingerprint: fixture.owner.fingerprint,
+        publicKey: fixture.owner.publicKey
+      })
+      try {
+        expect(reopened.prepare('SELECT COUNT(*) AS count FROM invites;').get()).toMatchObject({ count: 0 })
+        expect(reopened.prepare('SELECT COUNT(*) AS count FROM messages;').get()).toMatchObject({ count: 0 })
+        expect(reopened.prepare('PRAGMA quick_check;').get()).toMatchObject({ quick_check: 'ok' })
+      } finally {
+        reopened.close()
+      }
+    } finally {
+      fixture.db.close()
+    }
+  })
 })
 
 function createTestDeviceIdentity() {

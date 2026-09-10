@@ -1,3 +1,4 @@
+import { join } from 'node:path'
 import type { BrowserWindowConstructorOptions } from 'electron'
 
 export function createMainWindowOptions(): BrowserWindowConstructorOptions {
@@ -12,7 +13,8 @@ export function createMainWindowOptions(): BrowserWindowConstructorOptions {
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: true,
-      webSecurity: true
+      webSecurity: true,
+      preload: join(__dirname, '../preload/index.js')
     }
   }
 }

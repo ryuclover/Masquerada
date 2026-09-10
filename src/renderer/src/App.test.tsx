@@ -4,11 +4,12 @@ import { describe, expect, it } from 'vitest'
 import App from './App'
 
 describe('App', () => {
-  it('exibe a confirmação de inicialização', () => {
+  it('exibe o onboarding local-first', () => {
     const html = renderToStaticMarkup(<App />)
 
-    expect(html).toContain('P2P Server')
-    expect(html).toContain('Aplicação iniciada com sucesso.')
+    expect(html).toContain('MASQUERADA')
+    expect(html).toContain('Criar servidor')
+    expect(html).toContain('Converse sem abrir mão do controle.')
   })
 })
 

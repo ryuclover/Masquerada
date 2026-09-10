@@ -48,6 +48,7 @@ function hostFixture(options: {
   resources?: ApplicationResources
   readServerState?: (context: { serverId: string; peerDeviceFingerprint: string }, signal: AbortSignal) => Promise<ServerState>
   authorizeServerStateRead?: (context: { serverId: string; peerDeviceFingerprint: string }, signal: AbortSignal) => Promise<void>
+  sendMessage?: (context: { serverId: string; peerDeviceFingerprint: string }, draft: { channelId: string; clientMessageId: string; content: string }, signal: AbortSignal) => Promise<{ sequence: number; messageId: string; createdAt: number; dedup: boolean }>
   monotonicNowMs?: () => number
 } = {}) {
   const resources = options.resources ?? new ApplicationResources()
@@ -57,12 +58,15 @@ function hostFixture(options: {
   })
   const read = vi.fn(options.readServerState ?? (async () => state))
   const authorize = vi.fn(options.authorizeServerStateRead ?? (async () => {}))
+  const send = vi.fn(options.sendMessage ?? (async (_context, draft) => ({
+    sequence: 1, messageId: draft.clientMessageId, createdAt: 1700000000, dedup: false
+  })))
   const host = createApplicationHost({
-    channel: seam.channel, serverId, readServerState: read, authorizeServerStateRead: authorize,
+    channel: seam.channel, serverId, readServerState: read, authorizeServerStateRead: authorize, sendMessage: send,
     monotonicNowMs: options.monotonicNowMs ?? now, resources
   })
   cleanup.push(host.close)
-  return { ...seam, host, sent, read, authorize, resources }
+  return { ...seam, host, sent, read, authorize, send, resources }
 }
 
 async function flush(): Promise<void> { await vi.advanceTimersByTimeAsync(0) }
@@ -84,7 +88,9 @@ describe('application endpoint capabilities and namespace', () => {
     expect(() => createApplicationClient({ channel: seam.channel, expectedServerId: peerDeviceFingerprint }))
       .toThrow('INVALID_BINDING')
     expect(() => createApplicationHost({ channel: seam.channel, serverId,
-      readServerState: async () => state, authorizeServerStateRead: async () => {} })).toThrow('INVALID_BINDING')
+      readServerState: async () => state, authorizeServerStateRead: async () => {}, sendMessage: async () => ({
+        sequence: 1, messageId: 'a'.repeat(32), createdAt: 1, dedup: false
+      }) })).toThrow('INVALID_BINDING')
     seam.close()
     expect(() => createApplicationClient({ channel: seam.channel, expectedServerId: serverId })).toThrow('INVALID_CHANNEL')
   })
@@ -390,7 +396,9 @@ describe('application host', () => {
     const clientSeam = tcpTransportTestOnly.createAuthorizedPeerChannel({ serverId, onSend: (frame) => hostSeam.deliver(frame) })
     const hostSeam = tcpTransportTestOnly.createAuthorizedPeerChannel({ serverId, peerDeviceFingerprint, onSend: (frame) => clientSeam.deliver(frame) })
     const host = createApplicationHost({ channel: hostSeam.channel, serverId,
-      readServerState: async () => state, authorizeServerStateRead: async () => {}, resources, monotonicNowMs: now })
+      readServerState: async () => state, authorizeServerStateRead: async () => {}, sendMessage: async () => ({
+        sequence: 1, messageId: 'a'.repeat(32), createdAt: 1, dedup: false
+      }), resources, monotonicNowMs: now })
     const client = createApplicationClient({ channel: clientSeam.channel, expectedServerId: serverId, resources, monotonicNowMs: now })
     cleanup.push(host.close, client.close)
     await expect(client.requestServerState().then(() => client.requestServerState())).resolves.toEqual(state)

@@ -10,6 +10,9 @@ import {
   type HistoryQuery,
   type HistoryResponsePayload,
   type HistoryWireMessage,
+  type MessageSendAccepted,
+  type MessageSendDraft,
+  type MessageSendResponsePayload,
   type ServerState,
   type ServerStateResponsePayload
 } from './application-protocol'
@@ -100,6 +103,7 @@ interface EndpointOptions {
 export function createApplicationClient(options: EndpointOptions & { expectedServerId: string }): {
   requestServerState(options?: { signal?: AbortSignal; timeoutMs?: number }): Promise<ServerState>
   requestHistory(query: HistoryQuery, options?: { signal?: AbortSignal; timeoutMs?: number }): Promise<{ messages: readonly HistoryWireMessage[]; hasMore: boolean }>
+  sendMessage(draft: MessageSendDraft, options?: { signal?: AbortSignal; timeoutMs?: number }): Promise<MessageSendAccepted>
   close(): void
 } {
   const { channel, expectedServerId, resources = sharedResources } = options
@@ -110,8 +114,9 @@ export function createApplicationClient(options: EndpointOptions & { expectedSer
   const responseIds = new Map<string, number>()
   const pending = new Map<string, {
     deadline: number
-    finish(error?: ApplicationEndpointError, result?: ServerState | { messages: readonly HistoryWireMessage[]; hasMore: boolean }): void
+    finish(error?: ApplicationEndpointError, result?: PendingResult): void
   }>()
+  type PendingResult = ServerState | { messages: readonly HistoryWireMessage[]; hasMore: boolean } | MessageSendAccepted
   let closed = false
   let sequence = 0
   let unregister = (): void => {}
@@ -145,7 +150,7 @@ export function createApplicationClient(options: EndpointOptions & { expectedSer
     if (time >= request.deadline) {
       request.finish(new ApplicationEndpointError('TIMEOUT'))
     } else if (envelope.payload.status === 'error') {
-      request.finish(new ApplicationEndpointError('UNAVAILABLE'))
+      request.finish(new ApplicationEndpointError(envelope.payload.code))
     } else if (envelope.payload.status === 'ok' && 'server' in envelope.payload) {
       request.finish(undefined, {
         displayName: envelope.payload.server.displayName,
@@ -156,15 +161,17 @@ export function createApplicationClient(options: EndpointOptions & { expectedSer
         messages: envelope.payload.messages,
         hasMore: envelope.payload.hasMore
       })
+    } else if (envelope.payload.status === 'ok' && 'accepted' in envelope.payload) {
+      request.finish(undefined, envelope.payload.accepted)
     }
   })
   removeClose = channel.onClose(close)
 
-  function issueRequest<P extends 'server-state' | 'history'>(
-    messageType: `${P}.request`,
-    payload: Record<string, never> | HistoryQuery,
+  function issueRequest(
+    messageType: 'server-state.request' | 'history.request' | 'message.send.request',
+    payload: Record<string, never> | HistoryQuery | MessageSendDraft,
     requestOptions: { signal?: AbortSignal; timeoutMs?: number }
-  ): Promise<ServerState | { messages: readonly HistoryWireMessage[]; hasMore: boolean }> {
+  ): Promise<PendingResult> {
     const { signal, timeoutMs = DEADLINE_MS } = requestOptions
     if (!Number.isFinite(timeoutMs) || timeoutMs <= 0 || timeoutMs > DEADLINE_MS) {
       return Promise.reject(new ApplicationEndpointError('INVALID_TIMEOUT'))
@@ -173,14 +180,14 @@ export function createApplicationClient(options: EndpointOptions & { expectedSer
     if (pending.size >= 8 || !resources.acquireClient()) {
       return Promise.reject(new ApplicationEndpointError('RESOURCE_LIMIT'))
     }
-    return new Promise((resolve, reject) => {
+    return new Promise<PendingResult>((resolve, reject) => {
       let finished = false
       let timer: ReturnType<typeof setTimeout> | undefined
       let messageId: string | undefined
       let registered = false
       const deadline = now() + timeoutMs
       const abort = (): void => finish(new ApplicationEndpointError('ABORTED'))
-      function finish(error?: ApplicationEndpointError, result?: ServerState | { messages: readonly HistoryWireMessage[]; hasMore: boolean }): void {
+      function finish(error?: ApplicationEndpointError, result?: PendingResult): void {
         if (finished) return
         finished = true
         if (timer !== undefined) clearTimeout(timer)
@@ -232,7 +239,14 @@ export function createApplicationClient(options: EndpointOptions & { expectedSer
     return issueRequest('history.request', query, requestOptions) as Promise<{ messages: readonly HistoryWireMessage[]; hasMore: boolean }>
   }
 
-  return { requestServerState, requestHistory, close }
+  function sendMessage(
+    draft: MessageSendDraft,
+    requestOptions: { signal?: AbortSignal; timeoutMs?: number } = {}
+  ): Promise<MessageSendAccepted> {
+    if (closed) return Promise.reject(new ApplicationEndpointError('CLOSED'))
+    return issueRequest('message.send.request', draft, requestOptions) as Promise<MessageSendAccepted>
+  }
+  return { requestServerState, requestHistory, sendMessage, close }
 }
 
 type ReadContext = Readonly<{ serverId: string; peerDeviceFingerprint: string }>
@@ -246,6 +260,7 @@ export function createApplicationHost(options: EndpointOptions & {
   serverId: string
   readServerState: (context: ReadContext, signal: AbortSignal) => Promise<ServerState>
   readServerHistory?: (context: ReadContext, query: HistoryQuery, signal: AbortSignal) => Promise<HistoryPage>
+  sendMessage: (context: ReadContext, draft: MessageSendDraft, signal: AbortSignal) => Promise<MessageSendAccepted>
   authorizeServerStateRead: (context: ReadContext, signal: AbortSignal) => Promise<void>
 }): { close(): void } {
   const { channel, serverId, resources = sharedResources } = options
@@ -281,7 +296,7 @@ export function createApplicationHost(options: EndpointOptions & {
 
   function sendResponse(
     request: ApplicationEnvelope & { kind: 'request' },
-    payload: ServerStateResponsePayload | HistoryResponsePayload,
+    payload: ServerStateResponsePayload | HistoryResponsePayload | MessageSendResponsePayload,
     deadline: number
   ): void {
     if (closed || now() >= deadline) return
@@ -290,7 +305,10 @@ export function createApplicationHost(options: EndpointOptions & {
       return
     }
     const frame = encodeApplicationEnvelope({
-      kind: 'response', messageType: request.messageType === 'history.request' ? 'history.response' : 'server-state.response',
+      kind: 'response',
+      messageType: request.messageType === 'history.request' ? 'history.response'
+        : request.messageType === 'message.send.request' ? 'message.send.response'
+        : 'server-state.response',
       messageId: createApplicationMessageId(),
       correlationId: request.messageId, serverId, channelId: null, sequence: sequence + 1, payload
     } as ApplicationEnvelope)
@@ -314,7 +332,7 @@ export function createApplicationHost(options: EndpointOptions & {
       if (!live()) return
       await options.authorizeServerStateRead(context, operation.controller.signal)
       if (!live()) return
-      let payload: ServerStateResponsePayload | HistoryResponsePayload
+      let payload: ServerStateResponsePayload | HistoryResponsePayload | MessageSendResponsePayload
       if (request.messageType === 'history.request') {
         const query = request.payload as HistoryQuery
         const page = await options.readServerHistory!(context, query, operation.controller.signal)
@@ -335,6 +353,11 @@ export function createApplicationHost(options: EndpointOptions & {
             messages = messages.slice(0, Math.ceil(messages.length / 2))
           }
         }
+      } else if (request.messageType === 'message.send.request') {
+        const draft = request.payload as MessageSendDraft
+        const accepted = await options.sendMessage(context, draft, operation.controller.signal)
+        if (!live()) return
+        payload = { status: 'ok', accepted }
       } else {
         const state = await options.readServerState(context, operation.controller.signal)
         if (!live()) return
@@ -343,9 +366,9 @@ export function createApplicationHost(options: EndpointOptions & {
         payload = { status: 'ok', server: { displayName: state.displayName }, channels: state.channels }
       }
       sendResponse(request, payload, deadline)
-    } catch {
+    } catch (error) {
       if (live()) {
-        try { sendResponse(request, { status: 'error', code: 'UNAVAILABLE' }, deadline) }
+        try { sendResponse(request, { status: 'error', code: sendErrorCode(error) }, deadline) }
         catch { close() }
       }
     } finally {
@@ -354,6 +377,24 @@ export function createApplicationHost(options: EndpointOptions & {
       active = undefined
       resources.releaseHost()
     }
+  }
+
+  function sendErrorCode(error: unknown): Exclude<MessageSendResponsePayload, { status: 'ok' }>['code'] {
+    if (error instanceof ApplicationEndpointError) {
+      const mapping: Record<string, Exclude<MessageSendResponsePayload, { status: 'ok' }>['code']> = {
+        APPLICATION_NOT_AUTHORIZED: 'FORBIDDEN',
+        SERVER_CHANNEL_ARCHIVED: 'ARCHIVED',
+        SERVER_CHANNEL_NOT_FOUND: 'NOT_FOUND',
+        SERVER_MESSAGE_NOT_FOUND: 'NOT_FOUND',
+        SERVER_MESSAGE_FORBIDDEN: 'FORBIDDEN',
+        SERVER_MESSAGE_CAPACITY_REACHED: 'CAPACITY',
+        SERVER_MESSAGE_DUPLICATE: 'INVALID',
+        SERVER_MESSAGE_INVALID: 'INVALID',
+        SERVER_CHANNEL_INVALID: 'INVALID'
+      }
+      return mapping[error.code] ?? 'UNAVAILABLE'
+    }
+    return 'UNAVAILABLE'
   }
 
   unregister = channel.registerMessageHandler([APPLICATION_MESSAGE_TYPE], (frame) => {

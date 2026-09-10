@@ -12,13 +12,15 @@ export interface ServerState {
   channels: readonly { channelId: string; name: string }[]
 }
 
+export type ApplicationErrorPayload = { status: 'error'; code: 'UNAVAILABLE' | 'FORBIDDEN' | 'NOT_FOUND' | 'INVALID' | 'CAPACITY' | 'ARCHIVED' }
+
 export type ServerStateResponsePayload =
   | {
       status: 'ok'
       server: { displayName: string }
       channels: readonly { channelId: string; name: string }[]
     }
-  | { status: 'error'; code: 'UNAVAILABLE' }
+  | ApplicationErrorPayload
 
 export interface HistoryWireMessage {
   sequence: number
@@ -42,7 +44,7 @@ export type HistoryResponsePayload =
       messages: readonly HistoryWireMessage[]
       hasMore: boolean
     }
-  | { status: 'error'; code: 'UNAVAILABLE' }
+  | ApplicationErrorPayload
 
 export const MAX_HISTORY_BATCH = 100
 export const MAX_MESSAGE_CONTENT_CODE_POINTS_WIRE = 4096
@@ -54,19 +56,36 @@ export type ApplicationEnvelope = {
 } & (
   | {
       kind: 'request'
-      messageType: 'server-state.request' | 'history.request'
+      messageType: 'server-state.request' | 'history.request' | 'message.send.request'
       correlationId: null
       sequence: null
-      payload: Record<string, never> | HistoryQuery
+      payload: Record<string, never> | HistoryQuery | MessageSendDraft
     }
   | {
       kind: 'response'
-      messageType: 'server-state.response' | 'history.response'
+      messageType: 'server-state.response' | 'history.response' | 'message.send.response'
       correlationId: string
       sequence: number
-      payload: ServerStateResponsePayload | HistoryResponsePayload
+      payload: ServerStateResponsePayload | HistoryResponsePayload | MessageSendResponsePayload
     }
 )
+
+export interface MessageSendDraft {
+  channelId: string
+  clientMessageId: string
+  content: string
+}
+
+export interface MessageSendAccepted {
+  sequence: number
+  messageId: string
+  createdAt: number
+  dedup: boolean
+}
+
+export type MessageSendResponsePayload =
+  | { status: 'ok'; accepted: MessageSendAccepted }
+  | ApplicationErrorPayload
 
 export class ApplicationProtocolError extends Error {
   constructor(readonly code: string) {
@@ -201,6 +220,17 @@ function validate(value: Json): asserts value is Json & ApplicationEnvelope {
       ) invalid()
       return
     }
+    if (envelope.messageType === 'message.send.request') {
+      exactKeys(payload, ['channelId', 'clientMessageId', 'content'])
+      if (
+        typeof payload.channelId !== 'string' || !ID.test(payload.channelId) ||
+        typeof payload.clientMessageId !== 'string' || !ID.test(payload.clientMessageId)
+      ) invalid()
+      const contentValue: Json | undefined = payload.content
+      if (contentValue === undefined || contentValue === null) invalid()
+      contentText(contentValue, MAX_MESSAGE_CONTENT_CODE_POINTS_WIRE)
+      return
+    }
     invalid()
   }
   if (
@@ -216,15 +246,49 @@ function validate(value: Json): asserts value is Json & ApplicationEnvelope {
     validateHistoryResponse(payload)
     return
   }
+  if (envelope.messageType === 'message.send.response') {
+    validateMessageSendResponse(payload)
+    return
+  }
   invalid()
 }
 
-function validateServerStateResponse(payload: { [key: string]: Json }): void {
-  if (payload.status === 'error') {
-    exactKeys(payload, ['status', 'code'])
-    if (payload.code !== 'UNAVAILABLE') invalid()
-    return
+function contentText(value: Json, maxCodePoints: number): void {
+  if (typeof value !== 'string' || value.length === 0 || [...value].length > maxCodePoints) invalid()
+  for (let index = 0; index < value.length; index++) {
+    const unit = value.charCodeAt(index)
+    if (unit <= 0x1f || (unit >= 0x7f && unit <= 0x9f)) invalid()
   }
+}
+
+function validateMessageSendResponse(payload: { [key: string]: Json }): void {
+  if (validateApplicationError(payload)) return
+  exactKeys(payload, ['status', 'accepted'])
+  if (payload.status !== 'ok') invalid()
+  const acceptedValue: Json | undefined = payload.accepted
+  if (acceptedValue === undefined || acceptedValue === null) invalid()
+  const accepted = record(acceptedValue)
+  exactKeys(accepted, ['sequence', 'messageId', 'createdAt', 'dedup'])
+  if (
+    typeof accepted.sequence !== 'number' || !Number.isSafeInteger(accepted.sequence) || accepted.sequence < 1 ||
+    typeof accepted.messageId !== 'string' || !ID.test(accepted.messageId) ||
+    typeof accepted.createdAt !== 'number' || !Number.isInteger(accepted.createdAt) || accepted.createdAt < 0 ||
+    typeof accepted.dedup !== 'boolean'
+  ) invalid()
+}
+
+function validateApplicationError(payload: { [key: string]: Json }): boolean {
+  if (payload.status !== 'error') return false
+  exactKeys(payload, ['status', 'code'])
+  if (
+    payload.code !== 'UNAVAILABLE' && payload.code !== 'FORBIDDEN' && payload.code !== 'NOT_FOUND' &&
+    payload.code !== 'INVALID' && payload.code !== 'CAPACITY' && payload.code !== 'ARCHIVED'
+  ) invalid()
+  return true
+}
+
+function validateServerStateResponse(payload: { [key: string]: Json }): void {
+  if (validateApplicationError(payload)) return
   exactKeys(payload, ['status', 'server', 'channels'])
   if (payload.status !== 'ok') invalid()
   const serverValue: Json | undefined = payload.server
@@ -251,11 +315,7 @@ function validateServerStateResponse(payload: { [key: string]: Json }): void {
 }
 
 function validateHistoryResponse(payload: { [key: string]: Json }): void {
-  if (payload.status === 'error') {
-    exactKeys(payload, ['status', 'code'])
-    if (payload.code !== 'UNAVAILABLE') invalid()
-    return
-  }
+  if (validateApplicationError(payload)) return
   exactKeys(payload, ['status', 'messages', 'hasMore'])
   if (payload.status !== 'ok') invalid()
   if (typeof payload.hasMore !== 'boolean') invalid()

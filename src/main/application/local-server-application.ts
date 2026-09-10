@@ -1,4 +1,5 @@
 import { isAuthorizedPeerChannel, type AuthorizedPeerChannel } from '../network/tcp-transport'
+import { ServerDatabaseError } from '../servers/server-database'
 import type { LocalServerStorage } from '../servers/local-server-storage'
 import { ApplicationEndpointError, type HistoryPage, createApplicationHost } from './application-endpoint'
 
@@ -47,6 +48,36 @@ export async function attachLocalServerApplication(options: {
         throw new ApplicationEndpointError('APPLICATION_NOT_AUTHORIZED')
       }
       return { displayName: current.displayName, channels: [] }
+    },
+    sendMessage: async (context, draft, signal) => {
+      signal.throwIfAborted()
+      const current = await storage.loadLocalServer(localStorageId)
+      signal.throwIfAborted()
+      if (current.serverId !== context.serverId) {
+        throw new ApplicationEndpointError('APPLICATION_NOT_AUTHORIZED')
+      }
+      try {
+        const message = await storage.createLocalServerMessage(localStorageId, {
+          channelId: draft.channelId,
+          content: draft.content,
+          clientMessageId: draft.clientMessageId,
+          actorFingerprint: context.peerDeviceFingerprint
+        })
+        signal.throwIfAborted()
+        return { sequence: message.sequence, messageId: message.messageId, createdAt: message.createdAt, dedup: false }
+      } catch (error) {
+        // Idempotent replay: return the original message instead of failing the retry.
+        if (error instanceof ServerDatabaseError && error.code === 'SERVER_MESSAGE_DUPLICATE') {
+          const original = await storage.findLocalServerMessageByClientMessageId(localStorageId, {
+            channelId: draft.channelId, clientMessageId: draft.clientMessageId
+          })
+          signal.throwIfAborted()
+          if (original) {
+            return { sequence: original.sequence, messageId: original.messageId, createdAt: original.createdAt, dedup: true }
+          }
+        }
+        throw error
+      }
     },
     readServerHistory: async (context, query, signal) => {
       signal.throwIfAborted()

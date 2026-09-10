@@ -1,4 +1,4 @@
-import { app, BrowserWindow, safeStorage } from 'electron'
+import { app, BrowserWindow, ipcMain, safeStorage } from 'electron'
 import { join } from 'node:path'
 
 import {
@@ -6,6 +6,13 @@ import {
   loadOrCreateDeviceIdentity
 } from './security/device-identity'
 import { initializeLocalServers } from './servers/local-servers'
+import {
+  createLocalServer,
+  createLocalServerChannel,
+  listLocalServerChannels,
+  listLocalServerMessages,
+  sendLocalServerMessage
+} from './servers/local-servers'
 import { createMainWindowOptions } from './window-options'
 
 function createWindow(): void {
@@ -22,6 +29,34 @@ function createWindow(): void {
   }
 }
 
+function registerIpc(): void {
+  ipcMain.handle('server:create', async (_event, displayName: unknown) => {
+    if (typeof displayName !== 'string' || displayName.length === 0 || displayName.length > 100) {
+      throw new Error('INVALID_SERVER_NAME')
+    }
+    const server = await createLocalServer(displayName)
+    return { localStorageId: server.localStorageId, serverId: server.serverId, displayName: server.displayName }
+  })
+  ipcMain.handle('channel:list', async (_event, storageId: unknown) => {
+    if (typeof storageId !== 'string') throw new Error('INVALID_STORAGE_ID')
+    return listLocalServerChannels(storageId)
+  })
+  ipcMain.handle('channel:create', async (_event, storageId: unknown, name: unknown) => {
+    if (typeof storageId !== 'string' || typeof name !== 'string') throw new Error('INVALID_ARGUMENT')
+    return createLocalServerChannel(storageId, name)
+  })
+  ipcMain.handle('message:list', async (_event, storageId: unknown, channelId: unknown) => {
+    if (typeof storageId !== 'string' || typeof channelId !== 'string') throw new Error('INVALID_ARGUMENT')
+    return listLocalServerMessages(storageId, channelId)
+  })
+  ipcMain.handle('message:send', async (_event, storageId: unknown, channelId: unknown, content: unknown) => {
+    if (typeof storageId !== 'string' || typeof channelId !== 'string' || typeof content !== 'string') {
+      throw new Error('INVALID_ARGUMENT')
+    }
+    return sendLocalServerMessage(storageId, channelId, content)
+  })
+}
+
 const hasSingleInstanceLock = app.requestSingleInstanceLock()
 
 if (!hasSingleInstanceLock) {
@@ -33,6 +68,7 @@ if (!hasSingleInstanceLock) {
       safeStorage
     )
     initializeLocalServers(deviceIdentity)
+    registerIpc()
     createWindow()
 
     app.on('activate', () => {

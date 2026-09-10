@@ -6,6 +6,7 @@ import {
 } from 'node:crypto'
 import { open, stat } from 'node:fs/promises'
 import { randomUUID } from 'node:crypto'
+import { isAbsolute } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 
 import type { InitialOwnerDeviceIdentity } from './initial-owner-binding'
@@ -1680,6 +1681,22 @@ export function getMessageById(db: DatabaseSync, messageId: string): ServerMessa
   return row === undefined ? undefined : parseAndValidateMessageRow(row, listMemberMap(db))
 }
 
+export function getMessageByClientMessageId(
+  db: DatabaseSync,
+  channelId: string,
+  clientMessageId: string
+): ServerMessage | undefined {
+  if (!HEX_32_PATTERN.test(channelId) || !HEX_32_PATTERN.test(clientMessageId)) {
+    return undefined
+  }
+
+  const row = db
+    .prepare(`SELECT ${MESSAGE_COLUMNS} FROM messages WHERE channel_id = ? AND client_message_id = ?;`)
+    .get(channelId, clientMessageId)
+
+  return row === undefined ? undefined : parseAndValidateMessageRow(row, listMemberMap(db))
+}
+
 export function editMessage(
   db: DatabaseSync,
   options: {
@@ -1807,6 +1824,65 @@ export function listMessages(
   const memberMap = listMemberMap(db)
 
   return rows.map((row) => parseAndValidateMessageRow(row, memberMap))
+}
+
+export const DEFAULT_RETENTION_TOMBSTONE_SECONDS = 30 * 24 * 60 * 60
+const MAX_RETENTION_SWEEP = 500
+
+/**
+ * Retention sweep (ETAPA 9.4): removes tombstones older than the threshold in one
+ * bounded transaction. Live messages are never removed here; capacity is already
+ * bounded by MAX_MESSAGES_PER_CHANNEL and the database page quota.
+ */
+export function applyMessageRetention(
+  db: DatabaseSync,
+  options: {
+    readonly nowSeconds: number
+    readonly maxTombstoneAgeSeconds?: number
+  }
+): { removed: number } {
+  const maxAge = options.maxTombstoneAgeSeconds ?? DEFAULT_RETENTION_TOMBSTONE_SECONDS
+  if (!Number.isSafeInteger(maxAge) || maxAge < 0) {
+    throw new ServerDatabaseError('SERVER_MESSAGE_INVALID')
+  }
+
+  const cutoff = options.nowSeconds - maxAge
+  db.exec('BEGIN IMMEDIATE;')
+  try {
+    const result = db
+      .prepare('DELETE FROM messages WHERE deleted_at IS NOT NULL AND deleted_at < ? AND message_id IN (SELECT message_id FROM messages WHERE deleted_at IS NOT NULL AND deleted_at < ? LIMIT ?);')
+      .run(cutoff, cutoff, MAX_RETENTION_SWEEP) as { changes?: number | bigint }
+    db.exec('COMMIT;')
+    return { removed: Number(result.changes ?? 0) }
+  } catch (error) {
+    try {
+      db.exec('ROLLBACK;')
+    } catch {
+      // Ignora
+    }
+    throw databaseWriteError(error, 'SERVER_MESSAGE_INVALID')
+  }
+}
+
+/**
+ * Consistent snapshot via SQLite VACUUM INTO (ETAPA 9.2): the target file must not
+ * exist; the source is read through the same open connection (valid schema).
+ */
+export function snapshotServerDatabase(db: DatabaseSync, snapshotPath: string): void {
+  if (
+    typeof snapshotPath !== 'string' ||
+    !isAbsolute(snapshotPath) ||
+    snapshotPath !== snapshotPath.trim() ||
+    /["'`;$]/.test(snapshotPath)
+  ) {
+    throw new ServerDatabaseError('SERVER_DATABASE_PATH_UNSAFE')
+  }
+
+  try {
+    db.exec(`VACUUM INTO '${snapshotPath.replaceAll("'", "''")}';`)
+  } catch (error) {
+    throw databaseWriteError(error, 'SERVER_DATABASE_INITIALIZATION_FAILED')
+  }
 }
 
 function isSqliteConstraintError(error: unknown): error is Record<string, unknown> {

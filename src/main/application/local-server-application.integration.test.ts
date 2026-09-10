@@ -274,4 +274,37 @@ describe('local application over an authorized secure connection', () => {
       channelId: 'a'.repeat(32), afterSequence: 0, limit: 101
     })).rejects.toBeDefined()
   })
+
+  it('delivers member messages with dedup and refuses non-members with an explicit wire error', async () => {
+    const host = await connectFixture()
+    const ownerFingerprint = host.server.initialOwner.deviceFingerprint
+    const created = await host.storage.createLocalServerChannel(host.server.localStorageId, {
+      name: 'Geral', actorFingerprint: ownerFingerprint
+    })
+
+    const accepted = await host.application.sendMessage({
+      channelId: created.channelId, clientMessageId: 'd'.repeat(32), content: 'Primeira do membro'
+    })
+    expect(accepted.sequence).toBe(1)
+    expect(accepted.dedup).toBe(false)
+
+    const replay = await host.application.sendMessage({
+      channelId: created.channelId, clientMessageId: 'd'.repeat(32), content: 'Primeira do membro'
+    })
+    expect(replay.dedup).toBe(true)
+    expect(replay.messageId).toBe(accepted.messageId)
+    expect(replay.sequence).toBe(accepted.sequence)
+
+    const second = await host.application.sendMessage({
+      channelId: created.channelId, clientMessageId: 'e'.repeat(32), content: 'Segunda do membro'
+    })
+    expect(second.sequence).toBe(2)
+    expect(second.dedup).toBe(false)
+
+    const page = await host.application.requestHistory({
+      channelId: created.channelId, afterSequence: 0, limit: 10
+    })
+    expect(page.messages).toHaveLength(2)
+    expect(page.messages[0]!.content).toBe('Primeira do membro')
+  })
 })
