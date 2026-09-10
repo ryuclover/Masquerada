@@ -1,4 +1,5 @@
-import { app, BrowserWindow, desktopCapturer, ipcMain, safeStorage } from 'electron'
+import { app, BrowserWindow, desktopCapturer, dialog, ipcMain, safeStorage } from 'electron'
+import { appendFileSync } from 'node:fs'
 import { join } from 'node:path'
 
 import {
@@ -19,11 +20,25 @@ import {
 } from './servers/local-servers'
 import { createMainWindowOptions } from './window-options'
 
-function createWindow(): void {
+let mainWindow: BrowserWindow | null = null
+
+function logStartup(msg: string): void {
+  try {
+    const logPath = join(app.getPath('temp'), 'masquerada-startup.log')
+    appendFileSync(logPath, `[${new Date().toISOString()}] ${msg}\n`, 'utf-8')
+  } catch {}
+}
+
+function createWindow(): BrowserWindow {
   const window = new BrowserWindow(createMainWindowOptions())
+  mainWindow = window
 
   window.once('ready-to-show', () => {
     window.show()
+  })
+
+  window.on('closed', () => {
+    mainWindow = null
   })
 
   if (process.env.ELECTRON_RENDERER_URL) {
@@ -31,6 +46,8 @@ function createWindow(): void {
   } else {
     void window.loadFile(join(__dirname, '../renderer/index.html'))
   }
+
+  return window
 }
 
 function registerIpc(): void {
@@ -94,19 +111,33 @@ function registerIpc(): void {
   })
 }
 
+logStartup(`Inicializando processo Masquerada (PID: ${process.pid}, exec: ${process.execPath})`)
+
 const hasSingleInstanceLock = app.requestSingleInstanceLock()
 
 if (!hasSingleInstanceLock) {
+  logStartup(`Outra instância já está em execução. Encerrando instância redundante (PID: ${process.pid}).`)
   app.quit()
 } else {
+  app.on('second-instance', () => {
+    logStartup(`Segunda instância detectada. Focando janela principal existente.`)
+    if (mainWindow) {
+      if (mainWindow.isMinimized()) mainWindow.restore()
+      mainWindow.focus()
+    }
+  })
+
   app.whenReady().then(async () => {
+    logStartup(`App ready recebido. Carregando identidade em: ${join(app.getPath('userData'), 'identity')}`)
     const deviceIdentity = await loadOrCreateDeviceIdentity(
       join(app.getPath('userData'), 'identity'),
       safeStorage
     )
+    logStartup(`Identidade carregada com sucesso. Inicializando servidores locais...`)
     initializeLocalServers(deviceIdentity)
     registerIpc()
     createWindow()
+    logStartup(`Janela principal criada com sucesso.`)
 
     app.on('activate', () => {
       if (BrowserWindow.getAllWindows().length === 0) {
@@ -116,11 +147,18 @@ if (!hasSingleInstanceLock) {
   }).catch((error: unknown) => {
     const errorCode =
       error instanceof DeviceIdentityError ? error.code : 'IDENTITY_INITIALIZATION_FAILED'
-    console.error(`Falha ao inicializar a identidade do dispositivo (${errorCode}).`)
+    const errorMsg = error instanceof Error ? error.stack || error.message : String(error)
+    logStartup(`ERRO FATAL ao inicializar (${errorCode}): ${errorMsg}`)
+    console.error(`Falha ao inicializar a identidade do dispositivo (${errorCode}).`, error)
+    dialog.showErrorBox(
+      'Erro ao Iniciar o Masquerada',
+      `Ocorreu um erro ao inicializar os dados locais do aplicativo:\n\n${errorCode}\n\nDetalhes:\n${errorMsg}`
+    )
     app.quit()
   })
 
   app.on('window-all-closed', () => {
+    logStartup(`Todas as janelas foram fechadas. Encerrando app.`)
     if (process.platform !== 'darwin') {
       app.quit()
     }

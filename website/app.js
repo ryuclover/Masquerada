@@ -29,17 +29,17 @@ document.addEventListener('DOMContentLoaded', () => {
       console.warn('Aviso ao carregar version.json dinâmico, aplicando fallback local:', err)
       applyVersionData({
         version: '0.1.0',
-        fileName: 'Masquerada-Portable.exe',
-        fileSizeFormatted: '97.1 MB',
-        sha256: '3a7ddce2362e0fc3757d274fd0e0702a9dd4181b81f953f36265517963e48bed',
-        downloadUrl: 'downloads/Masquerada-Portable.exe'
+        fileName: 'Masquerada-Windows-x64.zip',
+        fileSizeFormatted: '153 MB',
+        sha256: '421e966b94ca53c830d6bbd1f1acc42c890b5140d089d649941e37d8fe548a37',
+        downloadUrl: 'https://github.com/ryuclover/Masquerada/releases/download/v0.1.0/Masquerada-Windows-x64.zip'
       })
     }
   }
 
   function applyVersionData(data) {
     const versionStr = `v${data.version || '0.1.0'}`
-    const sizeStr = data.fileSizeFormatted || '97.1 MB'
+    const sizeStr = data.fileSizeFormatted || '153 MB'
 
     if (navVersionBadge) navVersionBadge.textContent = versionStr
     if (footerVersion) footerVersion.textContent = versionStr
@@ -47,7 +47,7 @@ document.addEventListener('DOMContentLoaded', () => {
     if (fileSizeDisplay) fileSizeDisplay.textContent = sizeStr
 
     if (downloadSubtitle) {
-      downloadSubtitle.textContent = `${versionStr} • 64-bit • ${sizeStr} • Portátil`
+      downloadSubtitle.textContent = `${versionStr} • 64-bit • ${sizeStr} • Pacote .ZIP (Pronto para Uso)`
     }
 
     if (primaryDownloadBtn) {
