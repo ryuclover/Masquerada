@@ -51,11 +51,9 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     if (primaryDownloadBtn) {
-      const targetUrl = data.downloadUrl || 'downloads/Masquerada-Portable.exe'
+      const targetUrl = data.downloadUrl || 'https://github.com/ryuclover/Masquerada/releases/download/v0.1.0/Masquerada-Windows-x64.zip'
       primaryDownloadBtn.setAttribute('href', targetUrl)
-      if (data.fileName) {
-        primaryDownloadBtn.setAttribute('download', data.fileName)
-      }
+      primaryDownloadBtn.removeAttribute('download')
     }
 
     if (sha256Display && data.sha256) {
