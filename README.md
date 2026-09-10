@@ -7,7 +7,7 @@
 
 <br/>
 
-[![Status do Deploy](https://img.shields.io/badge/Site_Oficial-Vercel-black?style=for-the-badge&logo=vercel)](https://masquerada.vercel.app)
+[![Baixar Masquerada para Windows](https://img.shields.io/badge/Download-Windows_.EXE-0078D4?style=for-the-badge&logo=windows&logoColor=white)](https://masquerada.vercel.app)
 [![Electron](https://img.shields.io/badge/Electron-30.x-47848F?style=for-the-badge&logo=electron&logoColor=white)](https://www.electronjs.org/)
 [![React 19](https://img.shields.io/badge/React-19-61DAFB?style=for-the-badge&logo=react&logoColor=black)](https://react.dev/)
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.x-3178C6?style=for-the-badge&logo=typescript&logoColor=white)](https://www.typescriptlang.org/)
@@ -19,7 +19,13 @@
 
 **Masquerada** é um ecossistema desktop de comunicação privada e soberana inspirado na experiência familiar de canais do Discord, mas fundamentado sobre uma **arquitetura 100% descentralizada (Local-First e Peer-to-Peer)**. Seus dados, chats, chaves criptográficas e transmissões de áudio e vídeo pertencem unicamente a você — sem servidores corporativos centrais, sem coleta de telemetria e sem mineração de dados.
 
-[🌐 **Site Oficial & Download**](#-site-oficial--portal-de-download) • [✨ **Funcionalidades**](#-principais-funcionalidades) • [📸 **Demonstração Visual**](#-demonstração-visual-da-aplicação) • [🛡️ **Arquitetura & Segurança**](#-arquitetura--segurança-p2p) • [🚀 **Como Executar**](#-como-rodar-o-projeto-localmente) • [📦 **Exportar .EXE**](#-como-exportar-o-executável-exe-para-windows)
+<br/>
+
+### 📥 [👉 **Clique aqui para Baixar o Executável (.EXE) para Windows**](https://masquerada.vercel.app)
+
+<br/>
+
+[✨ **Funcionalidades**](#-principais-funcionalidades) • [📸 **Demonstração Visual**](#-demonstração-visual-da-aplicação) • [🛡️ **Arquitetura & Segurança**](#-arquitetura--segurança-p2p) • [🚀 **Como Executar**](#-como-rodar-o-projeto-localmente) • [📦 **Exportar .EXE**](#-como-exportar-o-executável-exe-para-windows)
 
 <br/>
 
@@ -82,15 +88,6 @@ Assista à transmissão de amigos em modo palco dedicado, com suporte a Tela Che
 
 ---
 
-### 5. Site Oficial e Portal de Download com Versionamento Dinâmico
-Portal web moderno pronto para deploy no **Vercel** (`website/`), com efeitos em Glassmorphism, detecção automática do sistema operacional e botão de download vinculado dinamicamente ao `version.json`.
-
-<p align="center">
-  <img src="docs/screenshots/05_site_download.png" alt="Site de Download Masquerada" width="100%" />
-</p>
-
----
-
 ## ⚡ Principais Funcionalidades
 
 ### 🎙️ Motor de Áudio & Voz HD
@@ -134,7 +131,7 @@ Portal web moderno pronto para deploy no **Vercel** (`website/`), com efeitos em
 | **Tempo Real & Mídia** | ![WebRTC](https://img.shields.io/badge/WebRTC-FF6C37?style=flat-square&logo=webrtc&logoColor=white) ![Web Audio API](https://img.shields.io/badge/Web_Audio_API-3776AB?style=flat-square) ![Opus](https://img.shields.io/badge/Opus_48kHz-005571?style=flat-square) |
 | **Persistência Local** | ![SQLite](https://img.shields.io/badge/SQLite-003B57?style=flat-square&logo=sqlite&logoColor=white) ![Local-First](https://img.shields.io/badge/Padrão-Local--First-4B5563?style=flat-square) |
 | **Testes & Qualidade** | ![Vitest](https://img.shields.io/badge/Vitest_58_Suites-6E9F18?style=flat-square&logo=vitest&logoColor=white) ![TypeScript Strict](https://img.shields.io/badge/TypeScript-Strict_0_Errors-3178C6?style=flat-square) |
-| **Distribuição & Web** | ![Electron Builder](https://img.shields.io/badge/Electron_Builder-20232A?style=flat-square) ![Vercel](https://img.shields.io/badge/Vercel-000000?style=flat-square&logo=vercel&logoColor=white) |
+| **Empacotamento** | ![Electron Builder](https://img.shields.io/badge/Electron_Builder-20232A?style=flat-square) ![Windows](https://img.shields.io/badge/Windows_Portable_%26_NSIS-0078D4?style=flat-square&logo=windows&logoColor=white) |
 
 </div>
 
@@ -177,7 +174,7 @@ npm run typecheck
 
 ## 📦 Como Exportar o Executável (.EXE) para Windows
 
-O projeto inclui um fluxo de automação completo para que desenvolvedores e usuários comuns possam gerar uma versão executável portátil sem dores de cabeça.
+O projeto inclui um fluxo de automação completo para gerar uma versão executável portátil sem complicações.
 
 ### Opção A: Executar o Script Automatizado (Recomendado)
 Basta dar um duplo clique no arquivo **`exportar-exe.bat`** na raiz do projeto (ou executá-lo no terminal):
@@ -190,7 +187,6 @@ O script realizará automaticamente:
 1. Verificação do ambiente Node.js e ferramentas de compilação.
 2. Build dos bundles de produção (`npm run build`).
 3. Empacotamento do binário `.exe` portátil via Electron Builder em `dist/`.
-4. Sincronização dos metadados de versão e hash SHA-256 no portal do site de download.
 
 ### Opção B: Via Comandos NPM
 ```bash
@@ -205,31 +201,6 @@ O executável final pronto para uso estará disponível na pasta `dist/` (ex: `d
 
 ---
 
-## 🌐 Site Oficial & Portal de Download
-
-O Masquerada acompanha uma landing page completa e responsiva pronta para publicação na **Vercel** localizada no diretório `website/`.
-
-### Como publicar na Vercel:
-
-#### Método 1: Via CLI da Vercel
-```bash
-# Acessar a pasta do site
-cd website
-
-# Fazer login e publicar em produção
-npx vercel --prod
-```
-
-#### Método 2: Pelo Painel Web da Vercel (GitHub Integration)
-1. Acesse seu painel no [Vercel](https://vercel.com).
-2. Clique em **Add New Project** e selecione o repositório `ryuclover/Masquerada`.
-3. Em **Root Directory**, selecione a pasta `website`.
-4. Clique em **Deploy**.
-
-> 💡 **Versionamento Automático:** Para disponibilizar novas versões do `.exe`, basta atualizar o arquivo `website/version.json` com a URL do release do GitHub e o número da nova versão. O site atualizará dinamicamente o botão de download e o badge de versão!
-
----
-
 ## 📂 Estrutura do Projeto
 
 ```plaintext
@@ -239,7 +210,7 @@ Masquerada/
 │   └── security/               # Baseline de segurança e Threat Model
 ├── scripts/                    # Scripts de suporte à exportação e sincronização de releases
 │   ├── export-exe.ps1          # Script PowerShell de empacotamento
-│   └── sync-website-release.js # Sincronizador de versão para o site
+│   └── sync-website-release.js # Sincronizador de versão
 ├── src/
 │   ├── main/                   # Processo principal do Electron (Janelas, IPC, SQLite, Capturer)
 │   ├── preload/                # Script de preload com ContextBridge segura
@@ -247,11 +218,6 @@ Masquerada/
 │       └── src/
 │           ├── components/     # Modais de tela, palco de voz, timeline de chat, amigos
 │           └── voice/          # Motor WebRTC, processamento de áudio, noise gate e SFX
-├── website/                    # Landing page oficial pronta para deploy no Vercel
-│   ├── index.html              # Interface do site oficial
-│   ├── style.css               # Folha de estilo em Glassmorphism e Neon
-│   ├── app.js                  # Lógica de download dinâmico e cópia de chave
-│   └── version.json            # Metadados da versão mais recente
 ├── electron-builder.yml        # Configuração de empacotamento Windows (.exe portátil e setup)
 ├── exportar-exe.bat            # Executador em lote para Windows em 1 clique
 └── package.json                # Dependências e scripts do projeto
