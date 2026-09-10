@@ -7,7 +7,7 @@
 
 <br/>
 
-[![Baixar Masquerada para Windows](https://img.shields.io/badge/Download-Windows_.EXE-0078D4?style=for-the-badge&logo=windows&logoColor=white)](https://masquerada.vercel.app)
+[![Baixar Masquerada para Windows](https://img.shields.io/badge/Download-Windows_.EXE-0078D4?style=for-the-badge&logo=windows&logoColor=white)](https://website-sigma-three-56.vercel.app/downloads/Masquerada-Portable.exe)
 [![Electron](https://img.shields.io/badge/Electron-30.x-47848F?style=for-the-badge&logo=electron&logoColor=white)](https://www.electronjs.org/)
 [![React 19](https://img.shields.io/badge/React-19-61DAFB?style=for-the-badge&logo=react&logoColor=black)](https://react.dev/)
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.x-3178C6?style=for-the-badge&logo=typescript&logoColor=white)](https://www.typescriptlang.org/)
@@ -21,7 +21,8 @@
 
 <br/>
 
-### 📥 [👉 **Clique aqui para Baixar o Executável (.EXE) para Windows**](https://masquerada.vercel.app)
+### 📥 [👉 **Clique aqui para Baixar o Executável (.EXE) para Windows**](https://website-sigma-three-56.vercel.app/downloads/Masquerada-Portable.exe)
+*(Ou acesse o [Portal Oficial de Download](https://website-sigma-three-56.vercel.app))*
 
 <br/>
 
