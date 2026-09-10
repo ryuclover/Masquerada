@@ -11,6 +11,10 @@ import {
   createLocalServerChannel,
   listLocalServerChannels,
   listLocalServerMessages,
+  listLocalServers,
+  listLocalServerMembers,
+  listLocalServerInvites,
+  createInvite,
   sendLocalServerMessage
 } from './servers/local-servers'
 import { createMainWindowOptions } from './window-options'
@@ -30,6 +34,10 @@ function createWindow(): void {
 }
 
 function registerIpc(): void {
+  ipcMain.handle('server:list', async () => {
+    const servers = await listLocalServers()
+    return servers.map((server: { localStorageId: string; serverId: string; displayName: string }) => ({ localStorageId: server.localStorageId, serverId: server.serverId, displayName: server.displayName }))
+  })
   ipcMain.handle('server:create', async (_event, displayName: unknown) => {
     if (typeof displayName !== 'string' || displayName.length === 0 || displayName.length > 100) {
       throw new Error('INVALID_SERVER_NAME')
@@ -54,6 +62,20 @@ function registerIpc(): void {
       throw new Error('INVALID_ARGUMENT')
     }
     return sendLocalServerMessage(storageId, channelId, content)
+  })
+  ipcMain.handle('member:list', async (_event, storageId: unknown) => {
+    if (typeof storageId !== 'string') throw new Error('INVALID_STORAGE_ID')
+    return listLocalServerMembers(storageId)
+  })
+  ipcMain.handle('invite:list', async (_event, storageId: unknown) => {
+    if (typeof storageId !== 'string') throw new Error('INVALID_STORAGE_ID')
+    return listLocalServerInvites(storageId)
+  })
+  ipcMain.handle('invite:create', async (_event, storageId: unknown, maxUses: unknown) => {
+    if (typeof storageId !== 'string' || typeof maxUses !== 'number' || !Number.isInteger(maxUses) || maxUses < 1 || maxUses > 100) {
+      throw new Error('INVALID_ARGUMENT')
+    }
+    return createInvite(storageId, maxUses)
   })
 }
 

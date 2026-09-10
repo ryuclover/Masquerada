@@ -34,8 +34,27 @@ export async function loadLocalServer(localStorageId: string): Promise<LocalServ
   return getStorage().loadLocalServer(localStorageId)
 }
 
+export async function listLocalServers() {
+  return getStorage().listLocalServers()
+}
+
 export async function listLocalServerChannels(localStorageId: string) {
   return getStorage().listLocalServerChannels(localStorageId)
+}
+
+export async function listLocalServerMembers(localStorageId: string) {
+  return getStorage().listLocalServerMembers(localStorageId)
+}
+
+export async function listLocalServerInvites(localStorageId: string) {
+  return getStorage().listLocalServerInvites(localStorageId)
+}
+
+export async function createInvite(localStorageId: string, maxUses: number) {
+  return getStorage().createLocalServerInvite(localStorageId, {
+    expiresAt: Math.floor(Date.now() / 1000) + 7 * 24 * 60 * 60,
+    maxUses
+  })
 }
 
 export async function createLocalServerChannel(localStorageId: string, name: string) {

@@ -4,6 +4,7 @@ import {
   lstat,
   mkdir,
   open,
+  readdir,
   readFile,
   realpath,
   rm,
@@ -30,6 +31,7 @@ import {
   getMessageByClientMessageId,
   listChannels,
   listMessages,
+  listMembers,
   renameChannel,
   setChannelArchived,
   type ServerChannel,
@@ -297,6 +299,28 @@ export function createLocalServerStorage(
       )
     },
 
+    listLocalServers: async (): Promise<readonly LocalServerMetadata[]> => {
+      const rootRealPath = await inspectServersRoot(serversRoot)
+      if (!rootRealPath) return []
+      const entries = await readdir(rootRealPath, { withFileTypes: true })
+      const servers: LocalServerMetadata[] = []
+      for (const entry of entries) {
+        if (!entry.isDirectory() || !isValidStorageId(entry.name)) continue
+        try {
+          const server = await loadLocalServerFromRoot(serversRoot, rootRealPath, entry.name, secureStorage, platform)
+          servers.push({
+            version: server.version,
+            localStorageId: server.localStorageId,
+            serverId: server.serverId,
+            displayName: server.displayName
+          })
+        } catch {
+          // Invalid/corrupt entries are not exposed as usable servers.
+        }
+      }
+      return Object.freeze(servers.sort((left, right) => left.displayName.localeCompare(right.displayName)))
+    },
+
     createLocalServerInvite: async (
       localStorageId: string,
       options: CreateServerInviteOptions
@@ -511,6 +535,39 @@ export function createLocalServerStorage(
       } finally {
         db.close()
       }
+    },
+
+    listLocalServerMembers: async (localStorageId: string): Promise<readonly Member[]> => {
+      const server = await loadLocalServerFromRoot(
+        serversRoot,
+        await requireServersRoot(),
+        localStorageId,
+        secureStorage,
+        platform
+      )
+      const db = openServerDatabase(deriveDirectChildPath(deriveDirectChildPath(serversRoot, localStorageId), DATABASE_FILE_NAME), {
+        deviceFingerprint: server.initialOwner.deviceFingerprint,
+        publicKey: server.initialOwner.publicKey
+      }, { serverId: server.serverId, serverPublicKey: server.identity.publicKey })
+      try { return Object.freeze(listMembers(db)) } finally { db.close() }
+    },
+
+    listLocalServerInvites: async (localStorageId: string): Promise<readonly StoredInvite[]> => {
+      const server = await loadLocalServerFromRoot(
+        serversRoot,
+        await requireServersRoot(),
+        localStorageId,
+        secureStorage,
+        platform
+      )
+      const db = openServerDatabase(deriveDirectChildPath(deriveDirectChildPath(serversRoot, localStorageId), DATABASE_FILE_NAME), {
+        deviceFingerprint: server.initialOwner.deviceFingerprint,
+        publicKey: server.identity.publicKey
+      }, { serverId: server.serverId, serverPublicKey: server.identity.publicKey })
+      try {
+        const rows = db.prepare('SELECT invite_id FROM invites ORDER BY expires_at DESC LIMIT 100;').all() as Array<{ invite_id?: unknown }>
+        return Object.freeze(rows.flatMap((row) => typeof row.invite_id === 'string' ? [getStoredInvite(db, row.invite_id)] : []).filter((invite): invite is StoredInvite => invite !== undefined))
+      } finally { db.close() }
     },
 
     admitLocalServerMemberWithInvite: async (
@@ -964,6 +1021,12 @@ export function createLocalServerStorage(
     } finally {
       db.close()
     }
+  }
+
+  async function requireServersRoot(): Promise<string> {
+    const root = await inspectServersRoot(serversRoot)
+    if (!root) throw new LocalServerStorageError('SERVER_NOT_FOUND')
+    return root
   }
 
   /**
